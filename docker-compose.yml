@@ -3,7 +3,7 @@ version: "3.9"
 x-logging: &default-logging
   driver: "json-file"
   options:
-    max-size: "10m"
+    max-size: "100m"
     max-file: "10"
     tag: "{{.ImageName}}|{{.Name}}|{{.ImageFullID}}|{{.FullID}}"
 
@@ -31,6 +31,11 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       DEBUG: ${DEBUG}
       ENVIRONMENT: ${ENVIRONMENT}
+      SENTRY_DSN: ${SENTRY_DSN}
+      SENTRY_RELEASE: ${SENTRY_RELEASE}
+      # Sentry environment should not be configured like this, but I never made it work with `sentry_sdk.init(environment=ENVIRONMENT)`.
+      SENTRY_ENVIRONMENT: ${ENVIRONMENT}
+      SENTRY_SAMPLE_RATE: ${SENTRY_SAMPLE_RATE}
       SQL_DATABASE: ${POSTGRES_DB}
       SQL_DATABASE_TEST: test_${POSTGRES_DB}
       SQL_USER: ${POSTGRES_USER}
@@ -44,7 +49,6 @@ services:
       STORAGE_REGION_NAME: ${STORAGE_REGION_NAME}
       STORAGE_ENDPOINT_URL: ${STORAGE_ENDPOINT_URL}
       QFIELDCLOUD_DEFAULT_NETWORK: ${QFIELDCLOUD_DEFAULT_NETWORK}
-      SENTRY_DSN: ${SENTRY_DSN}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       GEODB_HOST: ${GEODB_HOST}
       GEODB_PORT: ${GEODB_PORT}
@@ -67,22 +71,24 @@ services:
       QFIELDCLOUD_ADMIN_URI: ${QFIELDCLOUD_ADMIN_URI}
       QFIELDCLOUD_WORKER_QFIELDCLOUD_URL: ${QFIELDCLOUD_WORKER_QFIELDCLOUD_URL}
       QFIELDCLOUD_SUBSCRIPTION_MODEL: ${QFIELDCLOUD_SUBSCRIPTION_MODEL}
+      QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS: ${QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS}
+      QFIELDCLOUD_DEFAULT_TIME_ZONE: ${QFIELDCLOUD_DEFAULT_TIME_ZONE}
       WEB_HTTP_PORT: ${WEB_HTTP_PORT}
       WEB_HTTPS_PORT: ${WEB_HTTPS_PORT}
       TRANSFORMATION_GRIDS_VOLUME_NAME: ${COMPOSE_PROJECT_NAME}_transformation_grids
-    depends_on:
-      - redis
     logging:
       driver: "json-file"
       options:
         max-size: "1000m"
-        max-file: "5"
+        max-file: "10"
         tag: "{{.ImageName}}|{{.Name}}|{{.ImageFullID}}|{{.FullID}}"
     labels:
       ofelia.enabled: "true"
       ofelia.job-exec.runcrons.no-overlap: "true"
       ofelia.job-exec.runcrons.schedule: "@every 1m"
       ofelia.job-exec.runcrons.command: python manage.py runcrons
+    depends_on:
+      - redis
 
   nginx:
     image: nginx:stable
@@ -104,7 +110,12 @@ services:
       LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
       LETSENCRYPT_STAGING: ${LETSENCRYPT_STAGING}
       LETSENCRYPT_RSA_KEY_SIZE: ${LETSENCRYPT_RSA_KEY_SIZE}
-    logging: *default-logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1000m"
+        max-file: "10"
+        tag: "{{.ImageName}}|{{.Name}}|{{.ImageFullID}}|{{.FullID}}"
 
   mkcert:
     image: vishnunair/docker-mkcert
@@ -158,10 +169,8 @@ services:
       - ${LOG_DIRECTORY}:/log
       - ${TMP_DIRECTORY}:/tmp
     logging: *default-logging
-    depends_on:
-      - redis
-      - app
     scale: ${QFIELDCLOUD_WORKER_REPLICAS}
+    stop_grace_period: 15m
 
   ofelia:
     image: mcuadros/ofelia:v0.3.4

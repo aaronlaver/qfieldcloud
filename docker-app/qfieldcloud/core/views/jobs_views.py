@@ -1,5 +1,11 @@
 from django.core.exceptions import ObjectDoesNotExist
-from qfieldcloud.core import permissions_utils, serializers
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
+from qfieldcloud.core import pagination, permissions_utils, serializers
 from qfieldcloud.core.models import Job, Project
 from rest_framework import generics, permissions, viewsets
 from rest_framework.response import Response
@@ -18,11 +24,34 @@ class JobPermissions(permissions.BasePermission):
         return permissions_utils.can_read_jobs(request.user, project)
 
 
+@extend_schema_view(
+    list=extend_schema(
+        description="List all jobs scheduled against the given project.",
+        parameters=[
+            OpenApiParameter(
+                name="project_id",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="File to be uploaded",
+            ),
+            OpenApiParameter(
+                name="force",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                default=0,
+                enum=[1, 0],
+                description="Force creating the job.",
+            ),
+        ],
+    )
+)
 class JobViewSet(viewsets.ReadOnlyModelViewSet):
-
     serializer_class = serializers.JobSerializer
     lookup_url_kwarg = "job_id"
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = pagination.QfcLimitOffsetPagination()
 
     def get_serializer_by_job_type(self, job_type, *args, **kwargs):
         if job_type == Job.Type.DELTA_APPLY:
@@ -37,11 +66,13 @@ class JobViewSet(viewsets.ReadOnlyModelViewSet):
     def get_serializer(self, *args, **kwargs):
         kwargs.setdefault("context", self.get_serializer_context())
 
-        if self.action in ("create"):
+        if self.action in ("create",):
             if "data" in kwargs:
                 job_type = kwargs["data"]["type"]
-            else:
+            elif args:
                 job_type = args[0].type
+            else:
+                return super().get_serializer(*args, **kwargs)
 
             return self.get_serializer_by_job_type(job_type, *args, **kwargs)
 

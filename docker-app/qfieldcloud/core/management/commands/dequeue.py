@@ -5,13 +5,13 @@ from time import sleep
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.management.base import BaseCommand
-from django.db import transaction
-from django.db.models import Count, Q
+from django.db import connection, transaction
 from qfieldcloud.core.models import Job
 from worker_wrapper.wrapper import (
     DeltaApplyJobRun,
     PackageJobRun,
     ProcessProjectfileJobRun,
+    cancel_orphaned_workers,
 )
 
 SECONDS = 5
@@ -46,46 +46,46 @@ class Command(BaseCommand):
             if settings.DATABASES["default"]["NAME"].startswith("test_"):
                 ContentType.objects.clear_cache()
 
+            cancel_orphaned_workers()
+
+            with connection.cursor() as cursor:
+                # NOTE `pg_is_in_recovery` returns `FALSE` if connected to the master node
+                cursor.execute("SELECT pg_is_in_recovery()")
+                # there is no way `cursor.fetchone()` returns no rows, therefore ignore the type warning
+                if cursor.fetchone()[0]:  # type: ignore
+                    raise Exception(
+                        "Expected `worker_wrapper` to be connected to the master DB node!"
+                    )
+
             queued_job = None
 
             with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
 
-                busy_projects_ids_qs = (
-                    Job.objects.filter(
-                        status=Job.Status.PENDING,
-                    )
-                    .annotate(
-                        active_jobs_count=Count(
-                            "project__jobs",
-                            filter=Q(
-                                project__jobs__status__in=[
-                                    Job.Status.QUEUED,
-                                    Job.Status.STARTED,
-                                ]
-                            ),
-                        )
-                    )
-                    .filter(active_jobs_count__gt=0)
-                    .values("active_jobs_count", "project_id")
-                )
-
-                busy_project_ids = [j["project_id"] for j in busy_projects_ids_qs]
+                busy_projects_ids_qs = Job.objects.filter(
+                    status__in=[
+                        Job.Status.QUEUED,
+                        Job.Status.STARTED,
+                    ]
+                ).values("project_id")
 
                 # select all the pending jobs, that their project has no other active job
                 jobs_qs = (
                     Job.objects.select_for_update(skip_locked=True)
                     .filter(status=Job.Status.PENDING)
-                    .exclude(project_id__in=busy_project_ids)
+                    .exclude(project_id__in=busy_projects_ids_qs)
+                    .order_by("created_at")
                 )
 
-                for job in jobs_qs:
-                    queued_job = job
+                # each `worker_wrapper` or `dequeue.py` script can handle only one job and we handle the oldest
+                queued_job = jobs_qs.first()
 
-                    logging.info(f"Dequeued job {job.id}, run!")
-
-                    job.status = Job.Status.QUEUED
-                    job.save()
-                    break
+                # there might be no jobs in the queue
+                if queued_job:
+                    logging.info(f"Dequeued job {queued_job.id}, run!")
+                    queued_job.status = Job.Status.QUEUED
+                    queued_job.save(update_fields=["status"])
 
             if queued_job:
                 self._run(queued_job)
@@ -96,17 +96,11 @@ class Command(BaseCommand):
 
                 for _i in range(SECONDS):
                     if killer.alive:
+                        cancel_orphaned_workers()
                         sleep(1)
 
             if options["single_shot"]:
                 break
-
-    def run(self, job_id, *args, **options):
-        try:
-            job = Job.objects.get(id=job_id)
-            self._run(job)
-        except Exception:
-            pass
 
     def _run(self, job: Job):
         job_run_classes = {

@@ -57,7 +57,8 @@ class ProjectSerializer(serializers.ModelSerializer):
                     code="invalid",
                 )
         else:
-            internal_data["owner"] = self.context["request"].user
+            if not self.instance or not self.instance.owner:
+                internal_data["owner"] = self.context["request"].user
 
         if "private" in internal_data:
             if internal_data["private"] is not None:
@@ -254,7 +255,7 @@ class StatusChoiceField(serializers.ChoiceField):
             if self._choices[i] == data:
                 return i
         raise serializers.ValidationError(
-            "Invalid status. Acceptable values are {0}.".format(
+            "Invalid status. Acceptable values are {}.".format(
                 list(self._choices.values())
             )
         )
@@ -377,7 +378,7 @@ class JobMixin:
         return last_active_job
 
     class Meta:
-        model = PackageJob
+        model = Job
         fields = (
             "id",
             "created_at",
@@ -415,6 +416,7 @@ class PackageJobSerializer(JobMixin, serializers.ModelSerializer):
 
         if not internal_value["project"].project_filename:
             raise exceptions.NoQGISProjectError()
+        return None
 
     class Meta(JobMixin.Meta):
         model = PackageJob
@@ -476,3 +478,38 @@ class JobSerializer(serializers.ModelSerializer):
         )
         order_by = "-created_at"
         allow_parallel_jobs = True
+
+
+class FileVersionSerializer(serializers.Serializer):
+    """NOTE not used for actual serialization, but for documentation suing Django Spectacular."""
+
+    size = serializers.IntegerField()
+    md5sum = serializers.CharField()
+    version_id = serializers.CharField()
+    last_modified = serializers.DateTimeField()
+    is_latest = serializers.BooleanField(required=False)
+    display = serializers.CharField()
+    sha256 = serializers.CharField(required=False)
+
+
+class FileSerializer(serializers.Serializer):
+    """NOTE not used for actual serialization, but for documentation suing Django Spectacular."""
+
+    versions = serializers.ListField(child=FileVersionSerializer())
+    sha256 = serializers.CharField(required=False)
+    name = serializers.CharField()
+    size = serializers.IntegerField()
+    md5sum = serializers.CharField()
+    last_modified = serializers.DateTimeField()
+    is_attachment = serializers.BooleanField()
+
+
+class LatestPackageSerializer(serializers.Serializer):
+    """NOTE not used for actual serialization, but for documentation suing Django Spectacular."""
+
+    files = serializers.ListSerializer(child=FileSerializer())
+    layers = serializers.JSONField()
+    status = serializers.ChoiceField(Job.Status)
+    package_id = serializers.UUIDField()
+    packaged_at = serializers.DateTimeField()
+    data_last_updated_at = serializers.DateTimeField()

@@ -16,6 +16,9 @@ from datetime import timedelta
 import sentry_sdk
 from sentry_sdk.integrations.django import DjangoIntegration
 
+# QFieldCloud specific configuration
+QFIELDCLOUD_HOST = os.environ["QFIELDCLOUD_HOST"]
+
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,7 +47,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT")
 
 # 'DJANGO_ALLOWED_HOSTS' should be a single string of hosts with a space between each.
 # For example: 'DJANGO_ALLOWED_HOSTS=localhost 127.0.0.1 [::1]'
-ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS").split(" ")
+ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(" ")
 
 AUTHENTICATION_BACKENDS = [
     "axes.backends.AxesBackend",
@@ -81,7 +84,7 @@ INSTALLED_APPS = [
     # style
     "rest_framework",
     "rest_framework.authtoken",
-    "drf_yasg",
+    "drf_spectacular",
     "allauth",
     "allauth.account",
     "allauth.socialaccount",
@@ -102,6 +105,7 @@ INSTALLED_APPS = [
     "migrate_sql",
     "constance",
     "constance.backends.database",
+    "django_extensions",
 ]
 
 MIDDLEWARE = [
@@ -112,6 +116,8 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "qfieldcloud.core.middleware.requests.attach_keys",  # QF-2540: Inspecting request after Django middlewares
+    "log_request_id.middleware.RequestIDMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django_currentuser.middleware.ThreadLocalUserMiddleware",
@@ -126,7 +132,7 @@ CRON_CLASSES = [
     # "qfieldcloud.core.cron.DeleteExpiredInvitationsJob",
     "qfieldcloud.core.cron.ResendFailedInvitationsJob",
     "qfieldcloud.core.cron.SetTerminatedWorkersToFinalStatusJob",
-    # "qfieldcloud.core.cron.DeleteObsoleteProjectPackagesJob",
+    "qfieldcloud.core.cron.DeleteObsoleteProjectPackagesJob",
 ]
 
 ROOT_URLCONF = "qfieldcloud.urls"
@@ -139,7 +145,9 @@ TEMPLATES = [
         ],
         "APP_DIRS": True,
         "OPTIONS": {
-            "builtins": [],
+            "builtins": [
+                "qfieldcloud.core.templatetags.filters",
+            ],
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
@@ -193,9 +201,9 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/2.2/topics/i18n/
 
-LANGUAGE_CODE = "en-us"
+LANGUAGE_CODE = "en"
 
-TIME_ZONE = "Europe/Zurich"
+TIME_ZONE = os.environ.get("QFIELDCLOUD_DEFAULT_TIME_ZONE") or "Europe/Zurich"
 
 USE_I18N = False
 
@@ -203,6 +211,13 @@ USE_L10N = True
 
 USE_TZ = True
 
+
+LANGUAGES = [
+    ("de", "German"),
+    ("en", "English"),
+    ("fr", "French"),
+    ("it", "Italian"),
+]
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/2.2/howto/static-files/
@@ -227,7 +242,9 @@ AUTH_USER_MODEL = "core.User"
 
 # QFieldCloud variables
 AUTH_TOKEN_LENGTH = 100
-AUTH_TOKEN_EXPIRATION_HOURS = 24 * 30
+AUTH_TOKEN_EXPIRATION_HOURS = int(
+    os.environ.get("QFIELDCLOUD_AUTH_TOKEN_EXPIRATION_HOURS") or 24 * 30
+)
 
 REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
@@ -237,7 +254,7 @@ REST_FRAMEWORK = {
         "qfieldcloud.authentication.authentication.TokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
-    "DEFAULT_SCHEMA_CLASS": "rest_framework.schemas.coreapi.AutoSchema",
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "EXCEPTION_HANDLER": "qfieldcloud.core.rest_utils.exception_handler",
 }
 
@@ -245,24 +262,63 @@ EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 SITE_ID = 1
 
-SWAGGER_SETTINGS = {
-    "LOGIN_URL": "rest_framework:login",
-    "LOGOUT_URL": "rest_framework:logout",
-}
-
 LOGIN_URL = "account_login"
 
+# Sentry configuration
+SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if SENTRY_DSN:
+    SENTRY_SAMPLE_RATE = float(os.environ.get("SENTRY_SAMPLE_RATE", 1))
 
-sentry_sdk.init(
-    dsn=os.environ.get("SENTRY_DSN", ""),
-    integrations=[DjangoIntegration()],
-    # Define how many random events are sent for performance monitoring
-    sample_rate=0.05,
-    server_name=os.environ.get("QFIELDCLOUD_HOST"),
-    # If you wish to associate users to errors (assuming you are using
-    # django.contrib.auth) you may enable sending PII data.
-    send_default_pii=True,
-)
+    def before_send(event, hint):
+        from qfieldcloud.core.exceptions import (
+            ProjectAlreadyExistsError,
+            ValidationError,
+        )
+        from qfieldcloud.subscription.exceptions import (
+            InactiveSubscriptionError,
+            PlanInsufficientError,
+            QuotaError,
+        )
+        from rest_framework.exceptions import ValidationError as RestValidationError
+
+        ignored_exceptions = (
+            ValidationError,
+            ProjectAlreadyExistsError,
+            QuotaError,
+            PlanInsufficientError,
+            InactiveSubscriptionError,
+            RestValidationError,
+        )
+
+        if "exc_info" in hint:
+
+            exc_class, _exc_object, _exc_tb = hint["exc_info"]
+
+            # Skip sending errors
+            if issubclass(exc_class, ignored_exceptions):
+                return None
+
+        return event
+
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[DjangoIntegration()],
+        server_name=QFIELDCLOUD_HOST,
+        #
+        # Sentry sample rate between 0 and 1. Read more on https://docs.sentry.io/platforms/python/configuration/sampling/ .
+        sample_rate=SENTRY_SAMPLE_RATE,
+        #
+        # If you wish to associate users to errors (assuming you are using
+        # django.contrib.auth) you may enable sending PII data.
+        send_default_pii=True,
+        #
+        # Filter some of the exception which we do not want to see on Sentry. Read more on https://docs.sentry.io/platforms/python/configuration/filtering/ .
+        before_send=before_send,
+        #
+        # Sentry environment should have been configured like this, but I didn't make it work.
+        # Therefore the Sentry environment is defined as `SENTRY_ENVIRONMENT` in `docker-compose.yml`.
+        # environment=ENVIRONMENT,
+    )
 
 
 # Django allauth configurations
@@ -295,8 +351,8 @@ AXES_RESET_ON_SUCCESS = True
 # Django email configuration
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = os.environ.get("EMAIL_HOST")
-EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS").lower() == "true"
-EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL").lower() == "true"
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "").lower() == "true"
+EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "").lower() == "true"
 EMAIL_PORT = os.environ.get("EMAIL_PORT")
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD")
@@ -313,9 +369,12 @@ INVITATIONS_GONE_ON_ACCEPT_ERROR = False
 TEST_RUNNER = "qfieldcloud.testing.QfcTestSuiteRunner"
 
 LOGLEVEL = os.environ.get("LOGLEVEL", "DEBUG").upper()
+LOG_REQUEST_ID_HEADER = "HTTP_X_REQUEST_ID"
+GENERATE_REQUEST_ID_IF_NOT_IN_HEADER = False
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {"request_id": {"()": "log_request_id.filters.RequestIDFilter"}},
     "formatters": {
         "json": {
             "()": "qfieldcloud.core.logging.formatters.CustomisedJSONFormatter",
@@ -324,6 +383,7 @@ LOGGING = {
     "handlers": {
         "console.json": {
             "class": "logging.StreamHandler",
+            "filters": ["request_id"],
             "formatter": "json",
         },
     },
@@ -346,7 +406,38 @@ QFIELDCLOUD_SUBSCRIPTION_MODEL = os.environ.get(
 QFIELDCLOUD_TOKEN_SERIALIZER = "qfieldcloud.core.serializers.TokenSerializer"
 QFIELDCLOUD_USER_SERIALIZER = "qfieldcloud.core.serializers.CompleteUserSerializer"
 
+# Admin URLS which will be skipped from checking if they return HTTP 200
+QFIELDCLOUD_TEST_SKIP_VIEW_ADMIN_URLS = (
+    "/admin/login/",
+    "/admin/logout/",
+    "/admin/password_change/",
+    "/admin/password_change/done/",
+    "/admin/autocomplete/",
+    "/admin/core/delta/add/",
+    "/admin/core/job/add/",
+    "/admin/axes/accessattempt/add/",
+    "/admin/axes/accessfailurelog/add/",
+    "/admin/axes/accesslog/add/",
+    "/admin/auditlog/logentry/add/",
+    "/admin/account/emailaddress/admin/export_emails_to_csv/",
+)
+
+# Sets the default admin list view per page, the Django default is 100
+QFIELDCLOUD_ADMIN_LIST_PER_PAGE = 20
+
+# Use pg meta table estimate for pagination and display above n entries
+QFIELDCLOUD_ADMIN_EXACT_COUNT_LIMIT = 10000
+
+# Default limit for paginating data from views using QfcLimitOffsetPagination
+QFIELDCLOUD_API_DEFAULT_PAGE_LIMIT = 50
+
+# Admin sort URLs which will be skipped from checking if they return HTTP 200
+QFIELDCLOUD_TEST_SKIP_SORT_ADMIN_URLS = ("/admin/django_cron/cronjoblog/?o=4",)
+
 APPLY_DELTAS_LIMIT = 1000
+
+# the value of the "source" key in each logger entry
+LOGGER_SOURCE = os.environ.get("LOGGER_SOURCE", None)
 
 DEBUG_TOOLBAR_CONFIG = {
     "SHOW_TOOLBAR_CALLBACK": lambda r: DEBUG and ENVIRONMENT == "development",
@@ -387,4 +478,89 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "WORKER_QGIS_CPU_SHARES",
     ),
     "Subscription": ("TRIAL_PERIOD_DAYS",),
+}
+
+
+# `django-auditlog` configurations, read more on https://django-auditlog.readthedocs.io/en/latest/usage.html
+AUDITLOG_INCLUDE_TRACKING_MODELS = [
+    # NOTE `Delta` and `Job` models are not being automatically audited, because their data changes very often and timestamps are available in their models.
+    {
+        "model": "account.emailaddress",
+    },
+    # NOTE Constance model cannot be audited. If enabled, an `IndexError list index out of range` is raised.
+    # {
+    #     "model": "constance.config",
+    # },
+    {
+        "model": "core.geodb",
+    },
+    {
+        "model": "core.organization",
+    },
+    # TODO check if we can use `Organization.members` m2m when next version is released as described in "Many-to-many fields" here https://django-auditlog.readthedocs.io/en/latest/usage.html#automatically-logging-changes
+    {
+        "model": "core.organizationmember",
+    },
+    {
+        "model": "core.person",
+        "exclude_fields": ["last_login", "updated_at"],
+    },
+    {
+        "model": "core.project",
+        # these fields are updated by scripts and will produce a lot of audit noise
+        "exclude_fields": [
+            "updated_at",
+            "data_last_updated_at",
+            "data_last_packaged_at",
+            "last_package_job",
+            "file_storage_bytes",
+        ],
+    },
+    # TODO check if we can use `Project.collaborators` m2m when next version is released as described in "Many-to-many fields" here https://django-auditlog.readthedocs.io/en/latest/usage.html#automatically-logging-changes
+    {
+        "model": "core.projectcollaborator",
+    },
+    {
+        "model": "core.secret",
+        "mask_fields": [
+            "value",
+        ],
+    },
+    # TODO check if we can use `Team.members` m2m when next version is released as described in "Many-to-many fields" here https://django-auditlog.readthedocs.io/en/latest/usage.html#automatically-logging-changes
+    {
+        "model": "core.team",
+    },
+    {
+        "model": "core.teammember",
+    },
+    {
+        "model": "core.user",
+        "exclude_fields": ["last_login", "updated_at"],
+    },
+    {
+        "model": "core.useraccount",
+    },
+    {
+        "model": "invitations.invitation",
+    },
+    {
+        "model": "subscription.package",
+    },
+    {
+        "model": "subscription.packagetype",
+    },
+    {
+        "model": "subscription.plan",
+    },
+    {
+        "model": "subscription.subscription",
+    },
+]
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "QFieldCloud JSON API",
+    "DESCRIPTION": "QFieldCloud JSON API",
+    "VERSION": "v1",
+    "CONTACT": {"email": "info@opengis.ch"},
+    "LICENSE": {"name": "License"},
 }

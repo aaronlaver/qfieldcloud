@@ -5,6 +5,7 @@ QFieldCloud is a Django based service designed to synchronize projects and data 
 QFieldCloud allows seamless synchronization of your field data with your spatial infrastructure with change tracking, team management and online-offline work capabilities in QField.
 
 # Hosted solution
+
 If you're interested in quickly getting up and running, we suggest subscribing to the version hosted by OPENGIS.ch at https://qfield.cloud. This is also the instance that is integrated by default into QField.
 <a href="https://qfield.cloud"><img alt="QFieldCloud logo" src="https://qfield.cloud/img/logo_horizontal_embedded_font.svg" width="100%"/></a>
 
@@ -20,7 +21,7 @@ QField and QFieldCloud documentation is deployed [here](https://docs.qfield.org)
 
 Clone the repository and all its submodules:
 
-    git clone --recurse-submodules git://github.com/opengisch/qfieldcloud.git
+    git clone --recurse-submodules git@github.com:opengisch/qfieldcloud.git
 
 To fetch upstream development, don't forget to update the submodules too:
 
@@ -65,34 +66,23 @@ To run all the unit and functional tests (on a throwaway test
 database and a throwaway test storage directory):
 
     export COMPOSE_FILE=docker-compose.yml:docker-compose.override.local.yml:docker-compose.override.test.yml
-    docker compose up -d
+    # (Re-)build the app service to install necessary test utilities (requirements_test.txt)
+    docker compose up -d --build
     docker compose run app python manage.py migrate
     docker compose run app python manage.py test --keepdb
 
 To run only a test module (e.g. `test_permission.py`)
 
-    docker compose run app python manage.py test qfieldcloud.core.tests.test_permission
+    docker compose run app python manage.py test --keepdb qfieldcloud.core.tests.test_permission
 
 ### Debugging
 
 > This section gives examples for VSCode, please adapt to your IDE)
 
-If using the provided docker-compose overrides for developement, `debugpy` is installed.
+If you are using the provided `docker-compose.override.local.yml`, then `debugpy` is automatically installed and configured for use.
 
-You can debug interactively by adding this snipped anywhere in the code.
-```python
-import debugpy
-debugpy.listen(("0.0.0.0", 5680))
-print("debugpy waiting for debugger... 🐛")
-debugpy.wait_for_client()  # optional
-```
+Add the following to your IDE to connect (example given for VSCode's `.vscode/launch.json`, triggered with `F5`):
 
-Or alternativley, prefix your commands with `python -m debugpy --listen 0.0.0.0:5680 --wait-for-client`.
-
-    docker compose run app -p 5680:5680 python -m debugpy --listen 0.0.0.0:5680 --wait-for-client manage.py test
-    docker compose run worker_wrapper -p 5681:5681 python -m debugpy --listen 0.0.0.0:5681 --wait-for-client manage.py test
-
-Then, configure your IDE to connect (example given for VSCode's `.vscode/launch.json`, triggered with `F5`):
 ```
 {
     "version": "0.2.0",
@@ -102,26 +92,64 @@ Then, configure your IDE to connect (example given for VSCode's `.vscode/launch.
             "type": "python",
             "request": "attach",
             "justMyCode": false,
-            "connect": {"host": "localhost", "port": 5680},
-            "pathMappings": [{
-                "localRoot": "${workspaceFolder}/docker-app/qfieldcloud",
-                "remoteRoot": "/usr/src/app/qfieldcloud"
-            }]
+            "connect": {"host": "localhost", "port": 5678},
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}/docker-app/qfieldcloud",
+                    "remoteRoot": "/usr/src/app/qfieldcloud"
+                },
+                {
+                    "localRoot": "${workspaceFolder}/docker-app/site-packages",
+                    "remoteRoot": "/usr/local/lib/python3.10/site-packages/"
+                },
+            ],
         },
         {
             "name": "QFC debug worker_wrapper",
             "type": "python",
             "request": "attach",
             "justMyCode": false,
-            "connect": {"host": "localhost", "port": 5681},
-            "pathMappings": [{
-                "localRoot": "${workspaceFolder}/docker-app/qfieldcloud",
-                "remoteRoot": "/usr/src/app/qfieldcloud"
-            }]
+            "connect": {"host": "localhost", "port": 5679},
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}/docker-app/qfieldcloud",
+                    "remoteRoot": "/usr/src/app/qfieldcloud"
+                },
+                {
+                    "localRoot": "${workspaceFolder}/docker-app/site-packages",
+                    "remoteRoot": "/usr/local/lib/python3.10/site-packages/"
+                },
+            ],
         }
     ]
 }
 ```
+
+To add breakpoints in vendor modules installed via `pip` or `apt`, you need a copy of their source code.
+The easiest way to achieve that is do actual copy of them:
+
+```
+docker compose cp app:/usr/local/lib/python3.10/site-packages/ docker-app/site-packages
+```
+
+The configuration for the vendor modules is the second object in the example `pathMappings` above, as well as setting `justMyCode` to `false`.
+
+Do not forget to copy the site packages every time any of the `requirements.txt` files are changed!
+
+If you are not using `docker-compose.override.local.yml`, there are other options.
+
+You can debug interactively by adding this snippet anywhere in the code.
+```python
+import debugpy
+debugpy.listen(("0.0.0.0", 5680))
+print("debugpy waiting for debugger... 🐛")
+debugpy.wait_for_client()  # optional
+```
+
+Or alternativley, prefix your commands with `python -m debugpy --listen 0.0.0.0:5680 --wait-for-client`.
+
+    docker compose run -p 5680:5680 app python -m debugpy --listen 0.0.0.0:5680 --wait-for-client manage.py test
+    docker compose run -p 5681:5681 worker_wrapper python -m debugpy --listen 0.0.0.0:5681 --wait-for-client manage.py test
 
 Note if you run tests using the `docker-compose.test.yml` configuration, the `app` and `worker-wrapper` containers expose ports `5680` and `5681` respectively.
 
@@ -170,21 +198,6 @@ Code style done with precommit
 
 ## Deployment
 
-
-### Servers
-
-QFieldCloud is published on two servers:
-
--   <https://dev.qfield.cloud/> This is a testing instance for new
-    features.
--   <https://app.qfield.cloud/> This is the production instance. At
-    the moment the deploy is done manually.
-
-On the servers, we need only the `docker-compose.yml` and not the
-"override" one. There are no mounted folders. To apply changes,
-the docker image must be re-built.
-
-
 ### Launch a server instance
 
 Copy the `.env.example` into `.env` file and configure it to your
@@ -209,11 +222,13 @@ Run the django database migrations
     docker compose exec app python manage.py migrate
 
 
-## Create a certificate using Let's Encrypt
+## Create or renew a certificate using Let's Encrypt
 
 If you are running the server on a server with a public domain, you can install Let's Encrypt certificate by running the following command:
 
     ./scripts/init_letsencrypt.sh
+
+The same command can also be used to update an expired certificate.
 
 Note you may want to change the `LETSENCRYPT_EMAIL`, `LETSENCRYPT_RSA_KEY_SIZE` and `LETSENCRYPT_STAGING` variables.
 
@@ -272,6 +287,14 @@ users. The template db has the following extensions installed:
 ### Storage
 
 You can use either the integrated `minio` object storage, or use an external provider (e. g. S3) with versioning enabled. Check the corresponding `STORAGE_*` environment variables for more info.
+
+## Collaboration
+
+Contributions welcome!
+
+Any PR including the `[WIP]` should be:
+- able to be checked-out without breaking the stack;
+- the specific feature being developed/modified should be testable locally (does not mean it should work correctly).
 
 ## Resources
 

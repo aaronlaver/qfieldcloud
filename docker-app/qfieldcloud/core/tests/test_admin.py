@@ -54,25 +54,12 @@ class QfcTestCase(TransactionTestCase):
         self.delta = Delta.objects.create(
             deltafile_id="f85b4d28-2444-40ce-95a8-6502bf4f00d9",
             project=self.project,
+            client_id="f85b4d28-2444-40ce-95a8-6502bf4f00d9",
             created_by=self.superuser,
             content={},
         )
 
     def test_admin_opens(self):
-        skip_urls = (
-            "/admin/login/",
-            "/admin/logout/",
-            "/admin/password_change/",
-            "/admin/password_change/done/",
-            "/admin/autocomplete/",
-            "/admin/core/delta/add/",
-            "/admin/core/job/add/",
-            "/admin/axes/accessattempt/add/",
-            "/admin/axes/accesslog/add/",
-        )
-        # TODO make tests pass for these sortable URLs
-        skip_sort_urls = ("/admin/django_cron/cronjoblog/?o=4",)
-
         self.client.force_login(self.superuser)
 
         urlconf = __import__(settings.ROOT_URLCONF, {}, {}, [""])
@@ -87,7 +74,7 @@ class QfcTestCase(TransactionTestCase):
             if "<" in url:
                 continue
 
-            if url in skip_urls:
+            if url in settings.QFIELDCLOUD_TEST_SKIP_VIEW_ADMIN_URLS:
                 continue
 
             # get page without any sorting
@@ -100,10 +87,12 @@ class QfcTestCase(TransactionTestCase):
 
             # check all different sort columns
             soup = BeautifulSoup(resp.content, "html.parser")
+
             for anchor in soup.select("th.sortable a"):
                 sort_url = f"{url}{anchor.get('href')}"
 
-                if sort_url in skip_sort_urls:
+                # TODO make tests pass for these sortable URLs
+                if sort_url in settings.QFIELDCLOUD_TEST_SKIP_SORT_ADMIN_URLS:
                     continue
 
                 resp = self.client.get(sort_url)

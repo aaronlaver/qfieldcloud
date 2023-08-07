@@ -4,7 +4,7 @@ from datetime import timedelta
 import django.db.utils
 from django.utils import timezone
 from qfieldcloud.authentication.models import AuthToken
-from qfieldcloud.core.models import Person, Project
+from qfieldcloud.core.models import Organization, Person, Project
 from qfieldcloud.core.tests.utils import set_subscription, setup_subscription_plans
 from rest_framework.test import APITransactionTestCase
 
@@ -25,17 +25,17 @@ class QfcTestCase(APITransactionTestCase):
         setup_subscription_plans()
         PackageType.get_storage_package_type.cache_clear()
 
-    def test_useraccount_gets_active_subscription(self):
+    def test_useraccount_gets_current_subscription(self):
         u1 = Person.objects.create(username="u1")
 
         self.assertEqual(Subscription.objects.count(), 1)
         self.assertEqual(
-            Subscription.objects.first(), u1.useraccount.active_subscription
+            Subscription.objects.first(), u1.useraccount.current_subscription
         )
 
     def test_subscription_periods_overlap_is_prevented(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         with self.assertRaises(django.db.utils.IntegrityError):
             Subscription.objects.create(
@@ -46,7 +46,7 @@ class QfcTestCase(APITransactionTestCase):
                 active_since=timezone.now(),
             )
 
-        self.assertEqual(u1.useraccount.active_subscription, subscription)
+        self.assertEqual(u1.useraccount.current_subscription, subscription)
 
     def test_active_storage_total_mb(self):
         """Test property has correct values in cases of no packages, with active package, and rewrite of the active package"""
@@ -310,7 +310,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_get_active_package(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         self.assertIsNone(
             subscription.get_active_package(PackageType.get_storage_package_type())
@@ -343,7 +343,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_get_active_package_quantity(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         self.assertEqual(
             subscription.get_active_package_quantity(
@@ -388,7 +388,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_get_future_package(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         self.assertIsNone(
             subscription.get_future_package(PackageType.get_storage_package_type())
@@ -429,7 +429,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_get_future_package_quantity(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         self.assertEqual(
             subscription.get_future_package_quantity(
@@ -513,7 +513,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_set_package_quantity_raises_on_non_premium_plan(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         with self.assertRaises(NotPremiumPlanException):
             subscription.set_package_quantity(PackageType.get_storage_package_type(), 2)
@@ -527,7 +527,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         created_package = Package.objects.create(
-            subscription=u1.useraccount.active_subscription,
+            subscription=u1.useraccount.current_subscription,
             type=PackageType.get_storage_package_type(),
             quantity=1,
             active_since=timezone.now() - timedelta(days=3),
@@ -554,7 +554,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         created_package = Package.objects.create(
-            subscription=u1.useraccount.active_subscription,
+            subscription=u1.useraccount.current_subscription,
             type=PackageType.get_storage_package_type(),
             quantity=1,
             active_since=timezone.now() - timedelta(days=3),
@@ -581,7 +581,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         created_package = Package.objects.create(
-            subscription=u1.useraccount.active_subscription,
+            subscription=u1.useraccount.current_subscription,
             type=PackageType.get_storage_package_type(),
             quantity=1,
             active_since=timezone.now() + timedelta(days=2),
@@ -599,7 +599,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_update_subscription(self):
         u1 = Person.objects.create(username="u1")
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
 
         self.assertEqual(Subscription.objects.count(), 1)
         self.assertEqual(subscription.status, Subscription.Status.ACTIVE_PAID)
@@ -615,7 +615,7 @@ class QfcTestCase(APITransactionTestCase):
         self.assertEqual(subscription.status, Subscription.Status.ACTIVE_PAST_DUE)
         self.assertEqual(subscription.requested_cancel_at, requested_cancel_at)
 
-    def test_get_or_create_active_subscription_when_already_exists(self):
+    def test_get_or_create_current_subscription_when_already_exists(self):
         u1 = Person.objects.create(username="u1")
         plan = Plan.objects.get(
             user_type=u1.useraccount.user.type,
@@ -639,15 +639,15 @@ class QfcTestCase(APITransactionTestCase):
 
         self.assertEqual(Subscription.objects.count(), 1)
 
-        found_subscription = Subscription.get_or_create_active_subscription(
+        found_subscription = Subscription.get_or_create_current_subscription(
             u1.useraccount
         )
 
         self.assertEqual(Subscription.objects.count(), 1)
         self.assertEqual(created_subscription, found_subscription)
-        self.assertEqual(found_subscription, u1.useraccount.active_subscription)
+        self.assertEqual(found_subscription, u1.useraccount.current_subscription)
 
-    def test_get_or_create_active_subscription_when_subscription_expired(self):
+    def test_get_or_create_current_subscription_when_subscription_expired(self):
         u1 = Person.objects.create(username="u1")
         plan = Plan.objects.get(
             user_type=u1.useraccount.user.type,
@@ -672,15 +672,15 @@ class QfcTestCase(APITransactionTestCase):
 
         self.assertEqual(Subscription.objects.count(), 1)
 
-        found_subscription = Subscription.get_or_create_active_subscription(
+        found_subscription = Subscription.get_or_create_current_subscription(
             u1.useraccount
         )
 
         self.assertEqual(Subscription.objects.count(), 2)
         self.assertNotEqual(created_subscription, found_subscription)
-        self.assertEqual(found_subscription, u1.useraccount.active_subscription)
+        self.assertEqual(found_subscription, u1.useraccount.current_subscription)
 
-    def test_get_or_create_active_subscription_when_no_subscription_exists(self):
+    def test_get_or_create_current_subscription_when_no_subscription_exists(self):
         u1 = Person.objects.create(username="u1")
 
         # already exists by default
@@ -690,12 +690,12 @@ class QfcTestCase(APITransactionTestCase):
 
         self.assertEqual(Subscription.objects.count(), 0)
 
-        found_subscription = Subscription.get_or_create_active_subscription(
+        found_subscription = Subscription.get_or_create_current_subscription(
             u1.useraccount
         )
 
         self.assertEqual(Subscription.objects.count(), 1)
-        self.assertEqual(found_subscription, u1.useraccount.active_subscription)
+        self.assertEqual(found_subscription, u1.useraccount.current_subscription)
 
     def test_create_default_plan_subscription(self):
         u1 = Person.objects.create(username="u1")
@@ -724,18 +724,53 @@ class QfcTestCase(APITransactionTestCase):
         with self.assertRaises(django.db.utils.IntegrityError):
             Subscription.create_default_plan_subscription(u1.useraccount)
 
+    def test_remaining_trial_organizations_is_set_and_decremented(
+        self,
+    ):
+        user_plan = Plan.objects.get(code="default_user")
+        user_plan.max_trial_organizations = 2
+        user_plan.save(update_fields=["max_trial_organizations"])
+        u1 = Person.objects.create(username="u1")
+
+        # remaining_trial_organizations is set on create_subscription
+        self.assertEqual(u1.remaining_trial_organizations, 2)
+
+        trial_plan = Plan.objects.get(code="default_org")
+        trial_plan.is_trial = True
+        trial_plan.save(update_fields=["is_trial"])
+
+        def assert_create_org_decrements_count(
+            org_name, user, remaining_trial_organizations
+        ):
+            Organization.objects.create(
+                username=org_name, organization_owner=user, created_by=user
+            )
+            user.refresh_from_db()
+            self.assertEqual(
+                user.remaining_trial_organizations, remaining_trial_organizations
+            )
+
+        # remaining_trial_organizations is decremented when creating a trial organization
+        assert_create_org_decrements_count("org1", u1, 1)
+
+        # remaining_trial_organizations is decremented down to 0
+        assert_create_org_decrements_count("org2", u1, 0)
+
+        # It doesn't directly prevent creating more trials, is just a counter that stays at 0
+        assert_create_org_decrements_count("org3", u1, 0)
+
     def test_project_lists_duplicates_if_multiple_subscriptions(self):
         u1 = Person.objects.create(username="u1")
-        old_subscription = u1.useraccount.active_subscription
+        old_subscription = u1.useraccount.current_subscription
         old_subscription.active_since -= timedelta(days=1)
-        old_subscription.active_until = timezone.now()
+        old_subscription.active_until = timezone.now().replace(microsecond=0)
         old_subscription.save()
 
         Project.objects.create(name="p1", owner=u1)
 
         count = Project.objects.for_user(u1).count()
 
-        new_subscription = u1.useraccount.active_subscription
+        new_subscription = u1.useraccount.current_subscription
 
         self.assertEqual(count, 1)
         self.assertNotEqual(old_subscription, new_subscription)

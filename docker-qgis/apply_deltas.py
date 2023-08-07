@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
+import re
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Union, cast
 
 try:
     # 3.8
@@ -13,7 +14,6 @@ except ImportError:
 import argparse
 import json
 import logging
-import shutil
 import textwrap
 import traceback
 from functools import lru_cache
@@ -23,7 +23,6 @@ import jsonschema
 
 # pylint: disable=no-name-in-module
 from qgis.core import (
-    QgsDataSourceUri,
     QgsExpression,
     QgsFeature,
     QgsGeometry,
@@ -35,7 +34,7 @@ from qgis.core import (
     QgsVectorLayerEditPassthrough,
     QgsVectorLayerUtils,
 )
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QDate, QDateTime, Qt, QTime
 
 logger = logging.getLogger(__name__)
 # /LOGGER
@@ -96,9 +95,10 @@ class DeltaFeature(TypedDict):
 
 
 class Delta(TypedDict):
-    id: Uuid
-    localFk: FeaturePk
-    sourceFk: FeaturePk
+    uuid: Uuid
+    clientId: Uuid
+    localPk: FeaturePk
+    sourcePk: FeaturePk
     localLayerId: LayerId
     sourceLayerId: LayerId
     method: DeltaMethod
@@ -147,7 +147,7 @@ class DeltaException(Exception):
         provider_errors: str = None,
         descr: str = None,
     ):
-        super(DeltaException, self).__init__(msg)
+        super().__init__(msg)
         self.e_type = e_type
         self.delta_file_id = delta_file_id
         self.layer_id = layer_id
@@ -169,7 +169,7 @@ delta_log = []
 
 
 def project_decorator(f):
-    def wrapper(opts: BaseOptions, *args, **kw):
+    def wrapper(opts: DeltaOptions, *args, **kw):
         project = QgsProject.instance()
         project.setAutoTransaction(opts["transaction"])
         project.read(opts.get("project_filename", opts["project"]))
@@ -177,6 +177,74 @@ def project_decorator(f):
         return f(project, opts, *args, **kw)  # type: ignore
 
     return wrapper
+
+
+def wkt_nan_to_zero(wkt: WKT) -> WKT:
+    """Support of `nan` values is non-standard in WKT.
+
+    Since it is poorly supported on QGIS and other FOSS tools, it's safer to convert the `nan` values to 0s for now. See https://github.com/qgis/QGIS/pull/47034/ .
+
+    Args:
+        wkt (WKT): wkt that might contain `nan` values
+
+    Returns:
+        WKT: WKT with `nan` values replaced with `0`s
+    """
+    old_wkt = wkt
+    new_wkt = re.sub(r"\bnan\b", "0", wkt, flags=re.IGNORECASE)
+
+    if old_wkt != new_wkt:
+        logger.info(f"Replaced nan values with 0s for {wkt=}")
+
+    return new_wkt
+
+
+def get_geometry_from_delta(
+    delta_feature: DeltaFeature, layer: QgsVectorLayer
+) -> Optional[QgsGeometry]:
+    """Converts the `geometry` WKT from the `DeltaFeature` to a `QgsGeometry` instance.
+
+    Args:
+        delta_feature (DeltaFeature): delta feature
+        layer (QgsVectorLayer): layer the feature is part of
+
+    Raises:
+        DeltaException
+
+    Returns:
+        Optional[QgsGeometry]: the parsed `QgsGeometry`. Might be invalid geometry. Returns `None` if no geometry has been modified.
+    """
+    geometry = None
+
+    if "geometry" in delta_feature:
+        if delta_feature["geometry"] is None:
+            # create an invalid geometry to indicate that the geometry has been deleted
+            geometry = QgsGeometry()
+        else:
+            wkt = delta_feature["geometry"].strip()
+
+            if not isinstance(wkt, str):
+                raise DeltaException(
+                    f"The provided geometry is of type {type(wkt)} which is neither null nor a WKT string."
+                )
+
+            if len(wkt) == 0:
+                raise DeltaException("Empty WKT string!")
+
+            wkt = wkt_nan_to_zero(wkt)
+            geometry = QgsGeometry.fromWkt(wkt)
+
+            # TODO consider also checking for `isEmpty()`. Not enabling it for now.
+            if geometry.isNull():
+                raise DeltaException(f"Null geometry from {wkt=}")
+
+            # E.g. Shapefile might report a `Polygon` geometry, even though it is a `MultiPolygon`
+            if geometry.type() != layer.geometryType():
+                logger.info(
+                    f"The provided geometry type {geometry.type()} differs from the layer geometry type {layer.geometryType()} for {wkt=}"
+                )
+
+    return geometry
 
 
 def delta_apply(
@@ -221,19 +289,12 @@ def cmd_delta_apply(project: QgsProject, opts: DeltaOptions) -> bool:
     try:
         del delta_log[:]
         deltas = load_delta_file(opts)
-
-        if opts["transaction"]:
-            raise NotImplementedError(
-                "Please check apply_deltas(project, deltas) and upgrade it, if needed"
-            )
-            # accepted_state = apply_deltas(project, deltas, inverse=opts['inverse'], overwrite_conflicts=opts['overwrite_conflicts'])
-        else:
-            accepted_state = apply_deltas_without_transaction(
-                project,
-                deltas,
-                inverse=opts["inverse"],
-                overwrite_conflicts=opts["overwrite_conflicts"],
-            )
+        accepted_state = apply_deltas_without_transaction(
+            project,
+            deltas,
+            inverse=opts["inverse"],
+            overwrite_conflicts=opts["overwrite_conflicts"],
+        )
 
         project.clear()
 
@@ -264,7 +325,7 @@ def cmd_delta_apply(project: QgsProject, opts: DeltaOptions) -> bool:
     print("========================")
 
     if opts.get("delta_log"):
-        with open(opts["delta_log"], "w") as f:
+        with open(str(opts["delta_log"]), "w") as f:
             json.dump(delta_log, f, indent=2, sort_keys=True, default=str)
 
     return has_uncaught_errors
@@ -330,10 +391,12 @@ def delta_file_args_loader(args: DeltaOptions) -> Optional[DeltaFile]:
     Returns:
         Optional[DeltaFile] -- loaded delta file on success, otherwise none
     """
-    if "delta_contents" not in args:
+    obj = args.get("delta_contents")
+    if not obj:
         return None
 
-    obj = args["delta_contents"]
+    obj = cast(dict, obj)
+
     get_json_schema_validator().validate(obj)
     delta_file = DeltaFile(
         obj["id"],
@@ -426,7 +489,7 @@ def apply_deltas_without_transaction(
     # apply deltas on each individual layer
     for idx, delta in enumerate(delta_file.deltas):
         delta_status = DeltaStatus.Applied
-        layer_id: str = delta.get("sourceLayerId")
+        layer_id: str = delta.get("sourceLayerId", "")
         layer: QgsVectorLayer = project.mapLayer(layer_id)
         feature = QgsFeature()
 
@@ -442,6 +505,10 @@ def apply_deltas_without_transaction(
                     f'Cannot start editing layer "{layer_id}"',
                     provider_errors=layer.dataProvider().errors(),
                 )
+
+            pk_attr_name = get_pk_attr_name(layer)
+            if not pk_attr_name:
+                raise DeltaException(f'Layer "{layer.name()}" has no primary key.')
 
             has_edit_buffer = layer.editBuffer() and not isinstance(
                 layer.editBuffer(), QgsVectorLayerEditPassthrough
@@ -502,19 +569,22 @@ def apply_deltas_without_transaction(
                 QCoreApplication.processEvents()
                 layer.committedFeaturesAdded.disconnect(committed_features_added_cb)
 
-            logger.info(f'Successfully applied delta on layer "{layer_id}"')
+            logger.info(
+                f'Successfully applied delta "{delta.get("uuid")}" on layer "{layer_id}"!'
+            )
 
             feature_pk = delta.get("sourcePk")
             modified_pk = None
             if feature.isValid():
-                _pk_attr_idx, pk_attr_name = find_layer_pk(layer)
-
-                if not pk_attr_name:
-                    raise DeltaException(f'Layer "{layer.name()}" has no primary key.')
-
                 modified_pk = feature.attribute(pk_attr_name)
 
-                if modified_pk and modified_pk != str(feature_pk):
+                if (
+                    modified_pk is not None
+                    # if the feature was newly created, do not expect `feature_pk` to match the `modified_pk`,
+                    # as the client cannot know the modified_pk in advance.
+                    and delta["method"] == str(DeltaMethod.CREATE)
+                    and str(modified_pk) != str(feature_pk)
+                ):
                     logger.warning(
                         f'The modified feature pk valued does not match "sourcePk" in the delta in "{layer_id}": sourcePk={feature_pk} modifiedFeaturePk={modified_pk}'
                     )
@@ -603,145 +673,6 @@ def apply_deltas_without_transaction(
     return has_applied_all_deltas
 
 
-def apply_deltas(
-    project: QgsProject,
-    delta_file: DeltaFile,
-    inverse: bool = False,
-    overwrite_conflicts: bool = False,
-) -> DeltaStatus:
-    """Applies the deltas from a loaded delta file on the layers in a project.
-
-    The general algorithm is as follows:
-    1) group all individual deltas by layer id.
-    2) make a backup of the layer data source. In case things go wrong, one
-    can rollback from them.
-    3) apply deltas on each individual layer:
-    startEditing -> apply changes -> commit
-    4) if all is good, delete the backup files.
-
-    Arguments:
-        project {QgsProject} -- project
-        delta_file {DeltaFile} -- delta file
-        inverse {bool} -- inverses the direction of the deltas. Makes the
-        delta `old` to `new` and `new` to `old`. Mainly used to rollback the
-        applied changes using the same delta file.
-        overwrite_conflicts {bool} -- whether the conflicts are ignored
-
-    Returns:
-        bool -- indicates whether a conflict occurred
-    """
-    has_conflict = False
-    deltas_by_layer: Dict[LayerId, List[Delta]] = {}
-    layers_by_id: Dict[LayerId, QgsVectorLayer] = {}
-    transcation_by_layer: Dict[str, str] = {}
-    opened_transactions: Dict[str, List[LayerId]] = {}
-
-    for layer_id in project.mapLayers():
-        layer = project.mapLayer(layer_id)
-        conn_type = layer.providerType()
-        conn_string = QgsDataSourceUri(layer.source()).connectionInfo(False)
-
-        if len(conn_string) == 0:
-            continue
-
-        # here we use '$$$$$' as a separator, nothing special, can be easily changed to any other string
-        transaction_id = conn_type + "$$$$$" + conn_string
-        transcation_by_layer[layer_id] = transaction_id
-        opened_transactions[transaction_id] = opened_transactions.get(
-            transaction_id, []
-        )
-        opened_transactions[transaction_id].append(layer_id)
-
-    # group all individual deltas by layer id
-    for d in delta_file.deltas:
-        layer_id = d["sourceLayerId"]
-        deltas_by_layer[layer_id] = deltas_by_layer.get(layer_id, [])
-        deltas_by_layer[layer_id].append(d)
-        layers_by_id[layer_id] = project.mapLayer(layer_id)
-
-        if not isinstance(layers_by_id[layer_id], QgsVectorLayer):
-            raise DeltaException(
-                "The layer does not exist: {}".format(layer_id), layer_id=layer_id
-            )
-
-    # make a backup of the layer data source.
-    for layer_id in layers_by_id.keys():
-        if not is_layer_file_based(layers_by_id[layer_id]):
-            continue
-
-        layer_path = get_layer_path(layers_by_id[layer_id])
-        layer_backup_path = get_backup_path(layer_path)
-
-        assert layer_path.exists()
-        # TODO enable this when needed
-        # assert not layer_backup_path.exists()
-
-        if not shutil.copyfile(layer_path, layer_backup_path):
-            raise DeltaException(
-                "Unable to backup file for layer {}".format(layer_id),
-                layer_id=layer_id,
-                e_type=DeltaExceptionType.IO,
-            )
-
-    modified_layer_ids: Set[LayerId] = set()
-
-    # apply deltas on each individual layer
-    for layer_id in deltas_by_layer.keys():
-        # keep the try/except block inside the loop, so we can have the `layer_id` context
-        try:
-            if apply_deltas_on_layer(
-                layers_by_id[layer_id],
-                deltas_by_layer[layer_id],
-                inverse,
-                overwrite_conflicts=overwrite_conflicts,
-            ):
-                has_conflict = True
-
-            modified_layer_ids.add(layer_id)
-        except DeltaException as err:
-            rollback_deltas(layers_by_id)
-            err.layer_id = err.layer_id or layer_id
-            err.delta_file_id = err.delta_file_id or delta_file.id
-            raise err
-        except Exception as err:
-            rollback_deltas(layers_by_id)
-            raise DeltaException("Failed to apply changes") from err
-
-    committed_layer_ids: Set[LayerId] = set()
-
-    for layer_id in deltas_by_layer.keys():
-        # keep the try/except block inside the loop, so we can have the `layer_id` context
-        try:
-            # the layer has already been commited. This might happend if there are multiple layers in the same transaction group.
-            if layer_id in committed_layer_ids:
-                continue
-
-            if layers_by_id[layer_id].commitChanges():
-                transaction_id = transcation_by_layer.get(layer_id)
-
-                if transaction_id and transaction_id in opened_transactions:
-                    committed_layer_ids = set(
-                        [*committed_layer_ids, *opened_transactions[transaction_id]]
-                    )
-                    del opened_transactions[transaction_id]
-                else:
-                    committed_layer_ids.add(layer_id)
-            else:
-                raise DeltaException("Failed to commit")
-        except DeltaException:
-            # all the modified layers must be rollbacked
-            for layer_id in modified_layer_ids - committed_layer_ids:
-                if not layers_by_id[layer_id].rollBack():
-                    logger.warning("Failed to rollback")
-
-            rollback_deltas(layers_by_id, committed_layer_ids=committed_layer_ids)
-
-    if not cleanup_backups(set(layers_by_id.keys())):
-        logger.warning("Failed to cleanup backups, other than that - success")
-
-    return DeltaStatus.Conflict if has_conflict else DeltaStatus.Applied
-
-
 def rollback_deltas(
     layers_by_id: Dict[LayerId, QgsVectorLayer],
     committed_layer_ids: Set[LayerId] = set(),
@@ -765,7 +696,7 @@ def rollback_deltas(
     for layer in layers_by_id.values():
         if layer.isEditable():
             if layer.rollBack():
-                logger.warning("Unable to rollback layer {}".format(layer.id()))
+                logger.warning(f"Unable to rollback layer {layer.id()}")
 
     # if there are already committed layers, restore the backup
     for layer_id in committed_layer_ids:
@@ -812,8 +743,8 @@ def cleanup_backups(layer_paths: Set[str]) -> bool:
     """
     is_success = True
 
-    for layer_path in layer_paths:
-        layer_path = Path(layer_path)
+    for layer_path_str in layer_paths:
+        layer_path = Path(layer_path_str)
         layer_backup_path = get_backup_path(layer_path)
         try:
             if layer_backup_path.exists():
@@ -821,129 +752,64 @@ def cleanup_backups(layer_paths: Set[str]) -> bool:
         except Exception as err:
             is_success = False
             logger.warning(
-                "Unable to remove backup: {}. Reason: {}".format(layer_backup_path, err)
+                f"Unable to remove backup: {layer_backup_path}. Reason: {err}"
             )
 
     return is_success
 
 
-def apply_deltas_on_layer(
-    layer: QgsVectorLayer,
-    deltas: List[Delta],
-    inverse: bool,
-    should_commit: bool = False,
-    overwrite_conflicts: bool = False,
-) -> bool:
-    """Applies the deltas on the layer provided.
+# NOTE this is very similar to the implementation in `libqfieldsync`.
+# I preferred to copy-paste it, rather than adding `libqfieldsync` as a dependency on the `apply_deltas`.
+@lru_cache()
+def get_pk_attr_name(layer: QgsVectorLayer) -> str:
+    pk_attr_name: str = ""
 
-    Arguments:
-        layer {QgsVectorLayer} -- target layer
-        deltas {List[Delta]} -- ordered list of deltas to be applied
-        inverse {bool} -- inverses the direction of the deltas. Makes the
-        delta `old` to `new` and `new` to `old`. Mainly used to rollback the
-        applied changes using the same delta file.
+    if layer.type() != QgsMapLayer.VectorLayer:
+        raise DeltaException(f"Expected layer {layer.name()} to be a vector layer!")
 
-    Keyword Arguments:
-        should_commit {bool} -- whether the changes should be committed
-        (default: {False})
-        overwrite_conflicts {bool} -- whether the conflicts are ignored
-
-    Raises:
-        DeltaException: whenever the changes cannot be applied
-
-    Returns:
-        bool -- indicates whether a conflict occurred
-    """
-    assert layer is not None
-    assert layer.type() == QgsMapLayerType.VectorLayer
-
-    has_conflict = False
-
-    if not layer.isEditable() and not layer.startEditing():
-        raise DeltaException("Cannot start editing")
-
-    for idx, d in enumerate(deltas):
-        assert d["sourceLayerId"] == layer.id()
-
-        delta = inverse_delta(d) if inverse else d
-
-        try:
-            if delta["method"] == str(DeltaMethod.CREATE):
-                create_feature(layer, delta, overwrite_conflicts=overwrite_conflicts)
-            elif delta["method"] == str(DeltaMethod.PATCH):
-                patch_feature(layer, delta, overwrite_conflicts=overwrite_conflicts)
-            elif delta["method"] == str(DeltaMethod.DELETE):
-                delete_feature(layer, delta, overwrite_conflicts=overwrite_conflicts)
-            else:
-                raise DeltaException("Unknown delta method")
-        except DeltaException as err:
-            # TODO I am lazy now and all these properties are set only here, but should be moved in depth
-            err.layer_id = err.layer_id or layer.id()
-            err.delta_idx = err.delta_idx or idx
-            err.delta_id = err.delta_id or delta.get("id")
-            err.method = err.method or delta.get("method")
-            err.feature_pk = err.feature_pk or delta.get("sourcePk")
-            err.provider_errors = err.provider_errors or layer.dataProvider().errors()
-
-            if err.e_type == DeltaExceptionType.Conflict:
-                has_conflict = True
-                logger.warning(
-                    "Conflicts while applying a single delta: {}".format(str(err)), err
-                )
-            else:
-                if not layer.rollBack():
-                    # So unfortunate situation, that the only safe thing to do is to cancel the whole script
-                    raise DeltaException(
-                        "Cannot rollback layer changes: {}".format(layer.id())
-                    ) from err
-
-                raise err
-        except Exception as err:
-            if not layer.rollBack():
-                # So unfortunate situation, that the only safe thing to do is to cancel the whole script
-                raise DeltaException(
-                    "Cannot rollback layer changes: {}".format(layer.id())
-                ) from err
-
-            raise DeltaException(
-                "An error has been encountered while applying delta:"
-                + str(err).replace("\n", ""),
-                layer_id=layer.id(),
-                delta_idx=idx,
-                delta_id=delta.get("id"),
-                method=delta.get("method"),
-                descr=traceback.format_exc(),
-                feature_pk=delta.get("sourcePk"),
-            ) from err
-
-    if should_commit and not layer.commitChanges():
-        if not layer.rollBack():
-            # So unfortunate situation, that the only safe thing to do is to cancel the whole script
-            raise DeltaException("Cannot rollback layer changes: {}".format(layer.id()))
-
-        raise DeltaException("Cannot commit changes")
-
-    return has_conflict
-
-
-def find_layer_pk(layer: QgsVectorLayer) -> Tuple[int, str]:
+    pk_indexes = layer.primaryKeyAttributes()
     fields = layer.fields()
-    pk_attrs = [*layer.primaryKeyAttributes(), fields.indexFromName("fid")]
-    # we assume the first index to be the primary key index... kinda stupid, but memory layers don't have primary key at all, but we use it on geopackages, but... snap!
-    pk_attr_idx = pk_attrs[0]
 
-    if pk_attr_idx == -1:
-        return (-1, "")
+    if len(pk_indexes) == 1:
+        pk_attr_name = fields[pk_indexes[0]].name()
+    elif len(pk_indexes) > 1:
+        raise DeltaException("Composite (multi-column) primary keys are not supported!")
+    else:
+        logger.info(
+            f'Layer "{layer.name()}" does not have a primary key. Trying to fallback to `fid`…'
+        )
 
-    pk_attr_name = fields.at(pk_attr_idx).name()
+        # NOTE `QgsFields.lookupField(str)` is case insensitive (so we support "fid", "FID", "Fid" etc),
+        # but also looks for the field alias, that's why we check the `field.name().lower() == "fid"`
+        fid_idx = fields.lookupField("fid")
+        if fid_idx >= 0 and fields.at(fid_idx).name().lower() == "fid":
+            fid_name = fields.at(fid_idx).name()
+            logger.info(
+                f'Layer "{layer.name()}" does not have a primary key so it uses the `fid` attribute as a fallback primary key. '
+                "This is an unstable feature! "
+                "Consider [converting to GeoPackages instead](https://docs.qfield.org/get-started/tutorials/get-started-qfc/#configure-your-project-layers-for-qfield). "
+            )
+            pk_attr_name = fid_name
 
-    return (pk_attr_idx, pk_attr_name)
+    if not pk_attr_name:
+        raise DeltaException(
+            f'Layer "{layer.name()}" neither has a primary key, nor an attribute `fid`! '
+        )
+
+    if "," in pk_attr_name:
+        raise DeltaException(f'Comma in field name "{pk_attr_name}" is not allowed!')
+
+    logger.info(
+        f'Layer "{layer.name()}" will use attribute "{pk_attr_name}" as a primary key.'
+    )
+
+    return pk_attr_name
 
 
 def get_feature(
     layer: QgsVectorLayer, delta: Delta, client_pks: Dict[str, str] = None
 ) -> QgsFeature:
-    _pk_attr_idx, pk_attr_name = find_layer_pk(layer)
+    pk_attr_name = get_pk_attr_name(layer)
 
     assert pk_attr_name
 
@@ -986,13 +852,14 @@ def create_feature(
     """
     fields = layer.fields()
     new_feat_delta = delta["new"]
-    geometry = QgsGeometry()
+    geometry = get_geometry_from_delta(new_feat_delta, layer)
 
-    if "geometry" in new_feat_delta:
-        if isinstance(new_feat_delta["geometry"], str):
-            geometry = QgsGeometry.fromWkt(new_feat_delta["geometry"])
-        elif new_feat_delta["geometry"] is not None:
-            logger.warning("The provided geometry is not null or a WKT string.")
+    # NOTE Make sure the geometry is a `QgsGeometry` instance, even though invalid, as `QgsVectorLayerUtils.createFeature()` requires it. Might be `None` if the layer is not spatial.
+    if geometry is None:
+        if layer.isSpatial():
+            logger.warning("A spatial layer delta should always contain a geometry.")
+
+        geometry = QgsGeometry()
 
     new_feat_attrs = new_feat_delta.get("attributes", {})
     feat_attrs = {}
@@ -1065,31 +932,20 @@ def patch_feature(
 
     if "geometry" in new_feature_delta:
         if layer.isSpatial():
-            if isinstance(new_feature_delta["geometry"], str):
-                geometry = QgsGeometry.fromWkt(new_feature_delta["geometry"])
-
-                if geometry.isNull() or geometry.type() != layer.geometryType():
-                    raise DeltaException(
-                        "The provided geometry type differs from the layer geometry type"
-                    )
-            elif new_feature_delta["geometry"] is None:
-                geometry = QgsGeometry()
-            else:
-                logger.warning(
-                    "The provided geometry is not null or a WKT string, ignoring geometry."
-                )
-
             if new_feature_delta["geometry"] == old_feature_delta.get("geometry"):
                 logger.warning(
                     "The geometries of the new and the old features are the same, even though by spec they should not be provided in such case. Ignoring geometry."
                 )
+            else:
+                geometry = get_geometry_from_delta(new_feature_delta, layer)
 
-            if geometry is not None:
-                if not layer.changeGeometry(old_feature.id(), geometry, True):
-                    raise DeltaException(
-                        "Unable to change geometry",
-                        provider_errors=layer.dataProvider().errors(),
-                    )
+                # NOTE if the geometry is `None`, it means the geometry has not been modified.
+                if geometry is not None:
+                    if not layer.changeGeometry(old_feature.id(), geometry, True):
+                        raise DeltaException(
+                            "Unable to change geometry",
+                            provider_errors=layer.dataProvider().errors(),
+                        )
         else:
             logger.warning("Layer is not spatial, ignoring geometry")
 
@@ -1115,7 +971,7 @@ def patch_feature(
             True,
         ):
             raise DeltaException(
-                'Unable to change attribute "{}"'.format(attr_name),
+                f'Unable to change attribute "{attr_name}"',
                 provider_errors=layer.dataProvider().errors(),
             )
 
@@ -1152,6 +1008,9 @@ def delete_feature(
                 f'Conflicts while applying delta "{delta["uuid"]}". Ignoring since `overwrite_conflicts` flag set to `True`.\nConflicts:\n{conflicts}'
             )
         else:
+            logger.warning(
+                f'Conflicts while applying delta "{delta["uuid"]}".\nConflicts:\n{conflicts}'
+            )
             raise DeltaException(
                 "There are conflicts with the already existing feature!",
                 conflicts=conflicts,
@@ -1209,9 +1068,23 @@ def compare_feature(
                 # conflicts.append(f'The attribute "{attr}" in the delta is not available in the original feature')
                 continue
 
-            if feature.attribute(attr) != delta_feature_attrs[attr]:
+            current_value = feature.attribute(attr)
+            incoming_value = delta_feature_attrs[attr]
+
+            # modify the incoming value to the desired type if needed
+            if incoming_value is not None:
+                if isinstance(current_value, QDateTime):
+                    incoming_value = QDateTime.fromString(
+                        incoming_value, Qt.ISODateWithMs
+                    )
+                elif isinstance(current_value, QDate):
+                    incoming_value = QDate.fromString(incoming_value, Qt.ISODate)
+                elif isinstance(current_value, QTime):
+                    incoming_value = QTime.fromString(incoming_value)
+
+            if current_value != incoming_value:
                 conflicts.append(
-                    f'The attribute "{attr}" that has a conflict:\n-{delta_feature_attrs[attr]}\n+{feature.attribute(attr)}'
+                    f'The attribute "{attr}" that has a conflict:\n-{current_value}\n+{incoming_value}'
                 )
 
     return conflicts
@@ -1324,11 +1197,6 @@ if __name__ == "__main__":
         "--inverse",
         action="store_true",
         help="Inverses the direction of the deltas. Makes the delta `old` to `new` and `new` to `old`. Mainly used to rollback the applied changes using the same delta file..",
-    )
-    parser_delta_apply.add_argument(
-        "--transaction",
-        action="store_true",
-        help='Apply individual deltas in the deltafile in the "all-or-nothing" manner, with transaction mode enabled',
     )
     parser_delta_apply.set_defaults(func=cmd_delta_apply)
     # /deltas

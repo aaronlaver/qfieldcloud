@@ -11,6 +11,8 @@ from qfieldcloud.core.models import (
     Team,
     TeamMember,
 )
+from qfieldcloud.subscription.exceptions import InactiveSubscriptionError, QuotaError
+from qfieldcloud.subscription.models import Subscription
 from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
@@ -112,7 +114,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
-        response = self.client.get("/api/v1/collaborators/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/collaborators/{self.project1.id}/")
 
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.data), 1)
@@ -179,7 +181,7 @@ class QfcTestCase(APITransactionTestCase):
 
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
         response = self.client.post(
-            "/api/v1/collaborators/{}/".format(self.project1.id),
+            f"/api/v1/collaborators/{self.project1.id}/",
             {
                 "collaborator": "user2",
                 "role": "editor",
@@ -208,9 +210,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
-        response = self.client.get(
-            "/api/v1/collaborators/{}/user2/".format(self.project1.id)
-        )
+        response = self.client.get(f"/api/v1/collaborators/{self.project1.id}/user2/")
 
         self.assertTrue(status.is_success(response.status_code))
         json = response.json()
@@ -233,7 +233,7 @@ class QfcTestCase(APITransactionTestCase):
 
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
         response = self.client.patch(
-            "/api/v1/collaborators/{}/user2/".format(self.project1.id),
+            f"/api/v1/collaborators/{self.project1.id}/user2/",
             {
                 "role": "admin",
             },
@@ -263,7 +263,7 @@ class QfcTestCase(APITransactionTestCase):
 
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
         response = self.client.delete(
-            "/api/v1/collaborators/{}/user2/".format(self.project1.id)
+            f"/api/v1/collaborators/{self.project1.id}/user2/"
         )
 
         self.assertTrue(status.is_success(response.status_code))
@@ -280,7 +280,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         # Delete the project
-        response = self.client.delete("/api/v1/projects/{}/".format(project1.id))
+        response = self.client.delete(f"/api/v1/projects/{project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
 
         # The project should not exist anymore
@@ -295,7 +295,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         # Get the project without permissions
-        response = self.client.get("/api/v1/projects/{}/".format(project1.id))
+        response = self.client.get(f"/api/v1/projects/{project1.id}/")
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["code"], "permission_denied")
@@ -383,12 +383,12 @@ class QfcTestCase(APITransactionTestCase):
         p.save()
         assert_no_role()
 
-        # Making the owner an organisation is not enough as user is not member of that org
+        # Making the owner an organization is not enough as user is not member of that org
         p.owner = o
         p.save()
         assert_no_role()
 
-        # As the user must be member of the organisation
+        # As the user must be member of the organization
         OrganizationMember.objects.create(organization=o, member=self.user1)
         assert_role("manager", "collaborator")
 
@@ -403,6 +403,27 @@ class QfcTestCase(APITransactionTestCase):
             ProjectCollaborator.objects.create(
                 project=p1, collaborator=u2, role=ProjectCollaborator.Roles.MANAGER
             )
+
+    def test_direct_collaborators(self):
+        u1 = Person.objects.create(username="u1")
+        u2 = Person.objects.create(username="u2")
+        o1 = Organization.objects.create(username="o1", organization_owner=u1)
+        p1 = Project.objects.create(name="p1", owner=o1, is_public=False)
+
+        OrganizationMember.objects.create(organization=o1, member=u2)
+        c1 = ProjectCollaborator.objects.create(
+            project=p1,
+            collaborator=u2,
+            role=ProjectCollaborator.Roles.MANAGER,
+            is_incognito=False,
+        )
+
+        self.assertEqual(len(p1.direct_collaborators), 1)
+
+        c1.is_incognito = True
+        c1.save()
+
+        self.assertEqual(len(p1.direct_collaborators), 0)
 
     def test_add_project_collaborator_and_being_org_member(self):
         u1 = Person.objects.create(username="u1")
@@ -461,3 +482,49 @@ class QfcTestCase(APITransactionTestCase):
         om1.delete()
 
         self.assertEqual(TeamMember.objects.filter(team=t1, member=u2).count(), 0)
+
+    def test_create_project_by_inactive_user(self):
+        p1 = Project.objects.create(
+            name="p1",
+            owner=self.user1,
+        )
+
+        subscription = self.user1.useraccount.current_subscription
+        subscription.status = Subscription.Status.INACTIVE_DRAFT
+        subscription.save()
+
+        # Make sure the user is inactive
+        self.assertFalse(self.user1.useraccount.current_subscription.is_active)
+
+        # Cannot create project if user's subscription is inactive
+        with self.assertRaises(InactiveSubscriptionError):
+            Project.objects.create(
+                name="p2",
+                owner=self.user1,
+            )
+
+        # Cant still modify existing project
+        p1.name = "p1-modified"
+        p1.save()
+
+    def test_create_project_if_user_is_over_quota(self):
+        plan = self.user1.useraccount.current_subscription.plan
+
+        # Create a project that uses all the storage
+        more_bytes_than_plan = (plan.storage_mb * 1000 * 1000) + 1
+        p1 = Project.objects.create(
+            name="p1",
+            owner=self.user1,
+            file_storage_bytes=more_bytes_than_plan,
+        )
+
+        # Cannot create another project if the user's plan is over quota
+        with self.assertRaises(QuotaError):
+            Project.objects.create(
+                name="p2",
+                owner=self.user1,
+            )
+
+        # Cant still modify existing project
+        p1.name = "p1-modified"
+        p1.save()

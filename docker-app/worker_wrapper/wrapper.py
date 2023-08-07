@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import docker
-import qfieldcloud.core.utils2.storage
 import requests
 from constance import config
+from django.conf import settings
 from django.db import transaction
 from django.forms.models import model_to_dict
 from django.utils import timezone
+from docker.client import DockerClient
+from docker.errors import APIError
 from docker.models.containers import Container
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
@@ -40,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 RETRY_COUNT = 5
 TIMEOUT_ERROR_EXIT_CODE = -1
+DOCKER_SIGKILL_EXIT_CODE = 137
 QGIS_CONTAINER_NAME = os.environ.get("QGIS_CONTAINER_NAME", None)
 QFIELDCLOUD_HOST = os.environ.get("QFIELDCLOUD_HOST", None)
 
@@ -62,7 +65,7 @@ class JobRun:
             self.job = self.job_class.objects.select_related().get(id=job_id)
             self.shared_tempdir = Path(tempfile.mkdtemp(dir="/tmp"))
         except Exception as err:
-            feedback = {}
+            feedback: Dict[str, Any] = {}
             (_type, _value, tb) = sys.exc_info()
             feedback["error"] = str(err)
             feedback["error_origin"] = "worker_wrapper"
@@ -74,7 +77,7 @@ class JobRun:
             if self.job:
                 self.job.status = Job.Status.FAILED
                 self.job.feedback = feedback
-                self.job.save()
+                self.job.save(update_fields=["status", "feedback"])
                 logger.exception(msg, exc_info=err)
             else:
                 logger.critical(msg, exc_info=err)
@@ -109,7 +112,7 @@ class JobRun:
         try:
             self.job.status = Job.Status.STARTED
             self.job.started_at = timezone.now()
-            self.job.save()
+            self.job.save(update_fields=["status", "started_at"])
 
             self.before_docker_run()
 
@@ -122,13 +125,37 @@ class JobRun:
                 volumes=volumes,
             )
 
-            if exit_code == TIMEOUT_ERROR_EXIT_CODE:
+            if exit_code == DOCKER_SIGKILL_EXIT_CODE:
+                feedback["error"] = "Docker engine sigkill."
+                feedback["error_type"] = "DOCKER_ENGINE_SIGKILL"
+                feedback["error_class"] = ""
+                feedback["error_origin"] = "container"
+                feedback["error_stack"] = ""
+
+                try:
+                    self.job.output = output.decode("utf-8")
+                    self.job.feedback = feedback
+                    self.job.status = Job.Status.FAILED
+                    self.job.save(update_fields=["output", "feedback"])
+                    logger.info(
+                        "Set job status to `failed` due to being killed by the docker engine.",
+                    )
+                except Exception as err:
+                    logger.error(
+                        "Failed to update job status, probably does not exist in the database.",
+                        exc_info=err,
+                    )
+                # No further action required, probably received by wrapper's autoclean mechanism when the `Project` is deleted
+                return
+            elif exit_code == TIMEOUT_ERROR_EXIT_CODE:
                 feedback["error"] = "Worker timeout error."
+                feedback["error_type"] = "TIMEOUT"
+                feedback["error_class"] = ""
                 feedback["error_origin"] = "container"
                 feedback["error_stack"] = ""
             else:
                 try:
-                    with open(self.shared_tempdir.joinpath("feedback.json"), "r") as f:
+                    with open(self.shared_tempdir.joinpath("feedback.json")) as f:
                         feedback = json.load(f)
 
                         if feedback.get("error"):
@@ -146,10 +173,11 @@ class JobRun:
 
             self.job.output = output.decode("utf-8")
             self.job.feedback = feedback
-            self.job.finished_at = timezone.now()
+            self.job.save(update_fields=["output", "feedback"])
 
             if exit_code != 0 or feedback.get("error") is not None:
                 self.job.status = Job.Status.FAILED
+                self.job.save(update_fields=["status"])
 
                 try:
                     self.after_docker_exception()
@@ -159,16 +187,16 @@ class JobRun:
                         exc_info=err,
                     )
 
-                self.job.save()
                 return
 
             # make sure we have reloaded the project, since someone might have changed it already
             self.job.project.refresh_from_db()
 
-            self.job.status = Job.Status.FINISHED
-            self.job.save()
-
             self.after_docker_run()
+
+            self.job.finished_at = timezone.now()
+            self.job.status = Job.Status.FINISHED
+            self.job.save(update_fields=["status", "finished_at"])
 
         except Exception as err:
             (_type, _value, tb) = sys.exc_info()
@@ -196,7 +224,7 @@ class JobRun:
                         exc_info=err,
                     )
 
-                self.job.save()
+                self.job.save(update_fields=["status", "feedback", "finished_at"])
             except Exception as err:
                 logger.error(
                     "Failed to handle exception and update the job status", exc_info=err
@@ -240,6 +268,10 @@ class JobRun:
         logger.info(f"Execute: {' '.join(command)}")
         volumes.append(f"{TRANSFORMATION_GRIDS_VOLUME_NAME}:/transformation_grids:ro")
 
+        # `docker_started_at`/`docker_finished_at` tracks the time spent on docker only
+        self.job.docker_started_at = timezone.now()
+        self.job.save(update_fields=["docker_started_at"])
+
         container: Container = client.containers.run(  # type:ignore
             QGIS_CONTAINER_NAME,
             command,
@@ -258,8 +290,16 @@ class JobRun:
             detach=True,
             mem_limit=config.WORKER_QGIS_MEMORY_LIMIT,
             cpu_shares=config.WORKER_QGIS_CPU_SHARES,
+            labels={
+                "app": f"{settings.ENVIRONMENT}_worker",
+                "type": self.job.type,
+                "job_id": str(self.job.id),
+                "project_id": str(self.job.project_id),
+            },
         )
 
+        self.job.container_id = container.id
+        self.job.save(update_fields=["docker_started_at", "container_id"])
         logger.info(f"Starting worker {container.id} ...")
 
         response = {"StatusCode": TIMEOUT_ERROR_EXIT_CODE}
@@ -267,8 +307,24 @@ class JobRun:
         try:
             # will throw an `requests.exceptions.ConnectionError`, but the container is still alive
             response = container.wait(timeout=self.container_timeout_secs)
+
+            if response["StatusCode"] == DOCKER_SIGKILL_EXIT_CODE:
+                logger.info(
+                    "Job canceled, probably due to deleted Project and Jobs.",
+                )
+
+                # No further action required, received by wrapper's autoclean mechanism when the `Project` is deleted
+                return (
+                    response["StatusCode"],
+                    b"Job has been cancelled by parent process!",
+                )
+
         except Exception as err:
             logger.exception("Timeout error.", exc_info=err)
+
+        # `docker_started_at`/`docker_finished_at` tracks the time spent on docker only
+        self.job.docker_finished_at = timezone.now()
+        self.job.save(update_fields=["docker_finished_at"])
 
         logs = b""
         # Retry reading the logs, as it may fail
@@ -294,7 +350,7 @@ class JobRun:
         retriable(lambda: container.remove())()
 
         logger.info(
-            f"Finished execution with code {response['StatusCode']}, logs:\n{logs}"
+            f"Finished execution with code {response['StatusCode']}, logs:\n{logs.decode()}"
         )
 
         if response["StatusCode"] == TIMEOUT_ERROR_EXIT_CODE:
@@ -314,45 +370,45 @@ class PackageJobRun(JobRun):
 
     def after_docker_run(self) -> None:
         # only successfully finished packaging jobs should update the Project.data_last_packaged_at
-        if self.job.status == Job.Status.FINISHED:
-            self.job.project.data_last_packaged_at = self.data_last_packaged_at
-            self.job.project.last_package_job = self.job
-            self.job.project.save(
-                update_fields=(
-                    "data_last_packaged_at",
-                    "last_package_job",
-                )
+        self.job.project.data_last_packaged_at = self.data_last_packaged_at
+        self.job.project.last_package_job = self.job
+        self.job.project.save(
+            update_fields=(
+                "data_last_packaged_at",
+                "last_package_job",
             )
+        )
 
-            try:
-                project_id = str(self.job.project.id)
-                package_ids = storage.get_stored_package_ids(project_id)
-                job_ids = [
-                    str(job["id"])
-                    for job in Job.objects.filter(
-                        type=Job.Type.PACKAGE,
-                    )
-                    .exclude(
-                        status__in=(Job.Status.FAILED, Job.Status.FINISHED),
-                    )
-                    .values("id")
-                ]
-
-                for package_id in package_ids:
-                    # keep the last package
-                    if package_id == str(self.job.project.last_package_job_id):
-                        continue
-
-                    # the job is still active, so it might be one of the new packages
-                    if package_id in job_ids:
-                        continue
-
-                    storage.delete_stored_package(project_id, package_id)
-            except Exception as err:
-                logger.error(
-                    "Failed to delete dangling packages, will be deleted via CRON later.",
-                    exc_info=err,
+        try:
+            project_id = str(self.job.project.id)
+            package_ids = storage.get_stored_package_ids(project_id)
+            job_ids = [
+                str(job["id"])
+                for job in Job.objects.filter(
+                    type=Job.Type.PACKAGE,
                 )
+                .exclude(id=self.job.id)
+                .exclude(
+                    status__in=(Job.Status.FAILED, Job.Status.FINISHED),
+                )
+                .values("id")
+            ]
+
+            for package_id in package_ids:
+                # keep the last package
+                if package_id == str(self.job.project.last_package_job_id):
+                    continue
+
+                # the job is still active, so it might be one of the new packages
+                if package_id in job_ids:
+                    continue
+
+                storage.delete_stored_package(project_id, package_id)
+        except Exception as err:
+            logger.error(
+                "Failed to delete dangling packages, will be deleted via CRON later.",
+                exc_info=err,
+            )
 
 
 class DeltaApplyJobRun(JobRun):
@@ -376,15 +432,15 @@ class DeltaApplyJobRun(JobRun):
                 delta_client_ids.append(delta.content["clientId"])
 
         local_to_remote_pk_deltas = Delta.objects.filter(
-            content__clientId__in=delta_client_ids,
+            client_id__in=delta_client_ids,
             last_modified_pk__isnull=False,
-        ).values("content__clientId", "content__localPk", "last_modified_pk")
+        ).values("client_id", "content__localPk", "last_modified_pk")
 
         client_pks_map = {}
 
-        for delta in local_to_remote_pk_deltas:
-            key = f"{delta['content__clientId']}__{delta['content__localPk']}"
-            client_pks_map[key] = delta["last_modified_pk"]
+        for delta_with_modified_pk in local_to_remote_pk_deltas:
+            key = f"{delta_with_modified_pk['client_id']}__{delta_with_modified_pk['content__localPk']}"
+            client_pks_map[key] = delta_with_modified_pk["last_modified_pk"]
 
         deltafile_contents = {
             "deltas": delta_contents,
@@ -495,7 +551,7 @@ class ProcessProjectfileJobRun(JobRun):
 
         thumbnail_filename = self.shared_tempdir.joinpath("thumbnail.png")
         with open(thumbnail_filename, "rb") as f:
-            thumbnail_uri = qfieldcloud.core.utils2.storage.upload_project_thumbail(
+            thumbnail_uri = storage.upload_project_thumbail(
                 project, f, "image/png", "thumbnail"
             )
         project.thumbnail_uri = project.thumbnail_uri or thumbnail_uri
@@ -508,5 +564,37 @@ class ProcessProjectfileJobRun(JobRun):
 
     def after_docker_exception(self) -> None:
         project = self.job.project
-        project.project_details = None
-        project.save(update_fields=("project_details",))
+
+        if project.project_details is not None:
+            project.project_details = None
+            project.save(update_fields=("project_details",))
+
+
+def cancel_orphaned_workers():
+    client: DockerClient = docker.from_env()
+
+    running_workers: List[Container] = client.containers.list(
+        filters={"label": f"app={settings.ENVIRONMENT}_worker"},
+    )
+
+    if len(running_workers) == 0:
+        return
+
+    worker_ids = [c.id for c in running_workers]
+
+    worker_with_job_ids = Job.objects.filter(container_id__in=worker_ids).values_list(
+        "container_id", flat=True
+    )
+
+    # Find all running worker containers where its Project and Job were deleted from the database
+    worker_without_job_ids = set(worker_ids) - set(worker_with_job_ids)
+
+    for worker_id in worker_without_job_ids:
+        container = client.containers.get(worker_id)
+        try:
+            container.kill()
+            container.remove()
+            logger.info(f"Cancel orphaned worker {worker_id}")
+        except APIError:
+            # Container already removed
+            pass

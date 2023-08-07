@@ -39,6 +39,10 @@ class QfcTestCase(APITestCase):
             organization_owner=self.user1,
         )
 
+        # Activate subscriptions
+        set_subscription((self.user1, self.user2), "default_user")
+        set_subscription(self.organization1, "default_org")
+
         # Create a project
         self.project1 = Project.objects.create(
             name="project1", is_public=False, owner=self.user1
@@ -105,7 +109,7 @@ class QfcTestCase(APITestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -131,7 +135,7 @@ class QfcTestCase(APITestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -142,7 +146,7 @@ class QfcTestCase(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_add_team_as_collaborators(self):
@@ -159,10 +163,12 @@ class QfcTestCase(APITestCase):
         u1 = Person.objects.create_user(username="u1")
         u2 = Person.objects.create_user(username="u2")
         u3 = Person.objects.create_user(username="u3")
+        set_subscription((u1), "default_user")
 
         # Create organizations
         o1 = Organization.objects.create(username="o1", organization_owner=u1)
         o2 = Organization.objects.create(username="o2", organization_owner=u1)
+        set_subscription((o1, o2), "default_org")
 
         # Create a team
         o1_t1 = Team.objects.create(username="@o1/o1_t1", team_organization=o1)
@@ -206,13 +212,13 @@ class QfcTestCase(APITestCase):
         assertBecomeCollaborator(u2, p1, perms.ReachedCollaboratorLimitError)
 
         # non-premium user cannot collaborate on private user project with max_premium_collaborators set to 1
-        subscription = u1.useraccount.active_subscription
+        subscription = u1.useraccount.current_subscription
         subscription.plan.max_premium_collaborators_per_private_project = 1
         subscription.plan.save()
         assertBecomeCollaborator(u2, p1, perms.ExpectedPremiumUserError)
 
         # premium user can collaborate on private user project with max_premium_collaborators set to 1
-        default_plan = u2.useraccount.active_subscription.plan
+        default_plan = u2.useraccount.current_subscription.plan
         set_subscription(
             u2,
             is_premium=True,
@@ -221,7 +227,7 @@ class QfcTestCase(APITestCase):
         assertBecomeCollaborator(u2, p1, None)
 
         # non-premium user can collaborate on public user project with max_premium_collaborators set to 1
-        subscription = u2.useraccount.active_subscription
+        subscription = u2.useraccount.current_subscription
         subscription.plan = default_plan
         subscription.plan.save()
         p1.is_public = True

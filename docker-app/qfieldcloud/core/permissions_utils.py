@@ -2,6 +2,7 @@ from typing import List, Literal, Union
 
 from deprecated import deprecated
 from django.utils.translation import gettext as _
+from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
     Delta,
     Organization,
@@ -13,6 +14,12 @@ from qfieldcloud.core.models import (
     Team,
 )
 from qfieldcloud.core.models import User as QfcUser
+from qfieldcloud.subscription.exceptions import (
+    InactiveSubscriptionError,
+    PlanInsufficientError,
+    QuotaError,
+    SubscriptionException,
+)
 from qfieldcloud.subscription.models import Subscription
 
 
@@ -277,6 +284,16 @@ def can_delete_files(user: QfcUser, project: Project) -> bool:
             ProjectCollaborator.Roles.ADMIN,
             ProjectCollaborator.Roles.MANAGER,
             ProjectCollaborator.Roles.EDITOR,
+        ],
+    )
+
+
+def can_delete_unnecessary_file_versions(user: QfcUser, project: Project) -> bool:
+    return user_has_project_roles(
+        user,
+        project,
+        [
+            ProjectCollaborator.Roles.ADMIN,
         ],
     )
 
@@ -597,7 +614,7 @@ def check_can_become_collaborator(user: QfcUser, project: Project) -> bool:
             _("Cannot add the project owner as a collaborator.")
         )
 
-    if project.collaborators.filter(collaborator=user).count() > 0:
+    if project.collaborators.filter(collaborator=user).exists():
         raise AlreadyCollaboratorError(
             _('The user "{}" is already a collaborator of project "{}".').format(
                 user.username, project.name
@@ -605,7 +622,7 @@ def check_can_become_collaborator(user: QfcUser, project: Project) -> bool:
         )
 
     max_premium_collaborators_per_private_project = (
-        project.owner.useraccount.active_subscription.plan.max_premium_collaborators_per_private_project
+        project.owner.useraccount.current_subscription.plan.max_premium_collaborators_per_private_project
     )
     if max_premium_collaborators_per_private_project >= 0 and not project.is_public:
         project_collaborators_count = project.direct_collaborators.count()
@@ -652,7 +669,7 @@ def check_can_become_collaborator(user: QfcUser, project: Project) -> bool:
 
         # Rules for private projects
         if not project.is_public:
-            if not user.useraccount.active_subscription.plan.is_premium:
+            if not user.useraccount.current_subscription.plan.is_premium:
                 raise ExpectedPremiumUserError(
                     _(
                         "Only premium users can be added as collaborators on private projects."
@@ -777,6 +794,9 @@ def can_cancel_subscription_at_period_end(
     Organization can be downgraded only by owners, need to be deleted.
     In any case cancellation is only possible if the plan allows it.
     """
+    if subscription.active_until is not None:
+        return False
+
     if not subscription.plan.is_cancellable:
         return False
 
@@ -828,3 +848,52 @@ def can_abort_subscription_cancellation(
         subscription.account.user,
         [OrganizationQueryset.RoleOrigins.ORGANIZATIONOWNER],
     )
+
+
+def check_supported_regarding_owner_account(
+    project: Project, ignore_online_layers: bool = False
+) -> Literal[True]:
+    account = project.owner.useraccount
+    subscription = account.current_subscription
+
+    if not subscription.is_active:
+        raise InactiveSubscriptionError
+    if not account.storage_free_bytes > 0:
+        raise QuotaError
+
+    if not ignore_online_layers:
+        if (
+            project.has_online_vector_data
+            and not subscription.plan.is_external_db_supported
+        ):
+            raise PlanInsufficientError(
+                _(
+                    "Owner's subscription plan does not support online vector layer datasource."
+                )
+            )
+    return True
+
+
+def is_supported_regarding_owner_account(project: Project) -> bool:
+    try:
+        return check_supported_regarding_owner_account(project)
+    except (SubscriptionException):
+        return False
+
+
+def can_always_upload_files(client_type) -> bool:
+    return client_type in (
+        AuthToken.ClientType.QFIELD,
+        AuthToken.ClientType.WORKER,
+    )
+
+
+def check_can_upload_file(project, client_type, file_size_bytes: int) -> Literal[True]:
+    if can_always_upload_files(client_type):
+        return True
+
+    quota_left_bytes = project.owner.useraccount.storage_free_bytes
+    if file_size_bytes > quota_left_bytes:
+        raise QuotaError(
+            f"Requiring {file_size_bytes} bytes of storage but only {quota_left_bytes} bytes available."
+        )

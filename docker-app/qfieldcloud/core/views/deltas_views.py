@@ -4,10 +4,14 @@ from datetime import datetime
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.utils.decorators import method_decorator
 from django.utils.translation import gettext as _
-from drf_yasg.utils import swagger_auto_schema
-from qfieldcloud.core import exceptions, permissions_utils, utils
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
+from qfieldcloud.core import exceptions, pagination, permissions_utils, utils
 from qfieldcloud.core.models import Delta, Project
 from qfieldcloud.core.serializers import DeltaSerializer
 from qfieldcloud.core.utils2 import jobs
@@ -32,24 +36,30 @@ class DeltaFilePermissions(permissions.BasePermission):
         return False
 
 
-@method_decorator(
-    name="get",
-    decorator=swagger_auto_schema(
-        operation_description="List all deltas of a project",
-        operation_id="List deltas",
-    ),
-)
-@method_decorator(
-    name="post",
-    decorator=swagger_auto_schema(
-        operation_description="Add a deltafile to a project",
-        operation_id="Add deltafile",
+@extend_schema_view(
+    get=extend_schema(description="Get all deltas of the given project."),
+    post=extend_schema(
+        description="Add a deltafile to the given project",
+        parameters=[
+            OpenApiParameter(
+                name="file",
+                type=OpenApiTypes.BINARY,
+                location=OpenApiParameter.QUERY,
+                required=True,
+                description="Deltafille to be uploaded.",
+            ),
+        ],
+        request=None,
+        responses={
+            200: OpenApiTypes.NONE,
+        },
     ),
 )
 class ListCreateDeltasView(generics.ListCreateAPIView):
 
     permission_classes = [permissions.IsAuthenticated, DeltaFilePermissions]
     serializer_class = DeltaSerializer
+    pagination_class = pagination.QfcLimitOffsetPagination()
 
     def post(self, request, projectid):
 
@@ -97,6 +107,7 @@ class ListCreateDeltasView(generics.ListCreateAPIView):
                         deltafile_id=deltafile_id,
                         project=project_obj,
                         content=delta,
+                        client_id=delta["clientId"],
                         created_by=self.request.user,
                     )
 
@@ -109,15 +120,15 @@ class ListCreateDeltasView(generics.ListCreateAPIView):
                                 "User has no rights to create delta on this project. Try inviting him as a collaborator with proper permissions and try again."
                             )
                         }
-                    elif not delta_obj.is_supported_regarding_owner_account:
-                        delta_obj.last_status = Delta.Status.UNPERMITTED
-                        delta_obj.last_feedback = {
-                            "msg": _(
-                                "Some features of this project are not supported by the owner's account. Either upgrade the account or ensure you're not using features such as remote layers, then try again."
-                            )
-                        }
                     else:
                         delta_obj.last_status = Delta.Status.PENDING
+
+                        if not delta_obj.project.owner_can_create_job:
+                            delta_obj.last_feedback = {
+                                "msg": _(
+                                    "Some features of this project are not supported by the owner's account. Deltas are created but kept pending. Either upgrade the account or ensure you're not using features such as remote layers, then try again."
+                                )
+                            }
 
                     delta_obj.save(force_insert=True)
                     created_deltas.append(delta_obj)
@@ -155,17 +166,14 @@ class ListCreateDeltasView(generics.ListCreateAPIView):
         return Delta.objects.filter(project=project_obj)
 
 
-@method_decorator(
-    name="get",
-    decorator=swagger_auto_schema(
-        operation_description="List deltas of a deltafile",
-        operation_id="List deltas of deltafile",
-    ),
+@extend_schema_view(
+    get=extend_schema(description="List deltas of the given deltafile.")
 )
 class ListDeltasByDeltafileView(generics.ListAPIView):
 
     permission_classes = [permissions.IsAuthenticated, DeltaFilePermissions]
     serializer_class = DeltaSerializer
+    pagination_class = pagination.QfcLimitOffsetPagination()
 
     def get_queryset(self):
         project_id = self.request.parser_context["kwargs"]["projectid"]
@@ -174,13 +182,11 @@ class ListDeltasByDeltafileView(generics.ListAPIView):
         return Delta.objects.filter(project=project_obj, deltafile_id=deltafile_id)
 
 
-@method_decorator(
-    name="post",
-    decorator=swagger_auto_schema(
-        operation_description="Trigger apply delta",
-        operation_id="Apply delta",
-    ),
+@extend_schema(
+    deprecated=True,
+    summary="This endpoint is deprecated and will be removed in the future. Please use `/jobs/` endpoint instead.",
 )
+@extend_schema_view(post=extend_schema(description="Trigger apply delta."))
 class ApplyView(views.APIView):
 
     permission_classes = [permissions.IsAuthenticated, DeltaFilePermissions]

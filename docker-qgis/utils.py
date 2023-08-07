@@ -1,6 +1,7 @@
 import atexit
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -118,7 +119,7 @@ def start_app():
     global QGISAPP
 
     if QGISAPP is None:
-        qgs_stderr_logger.info(
+        logging.info(
             f"Starting QGIS app version {Qgis.versionInt()} ({Qgis.devVersion()})..."
         )
         argvb = []
@@ -140,6 +141,8 @@ def start_app():
         def exitQgis():
             stop_app()
 
+        logging.info("QGIS app started!")
+
     return QGISAPP
 
 
@@ -156,7 +159,7 @@ def stop_app():
     QgsProject.instance().read("")
 
     if QGISAPP is not None:
-        qgs_stderr_logger.info("Stopping QGIS app…")
+        logging.info("Stopping QGIS app…")
         QGISAPP.exitQgis()
         del QGISAPP
 
@@ -166,6 +169,8 @@ def download_project(
 ) -> Path:
     """Download the files in the project "working" directory from the S3
     Storage into a temporary directory. Returns the directory path"""
+    logging.info("Preparing a temporary directory for project files…")
+
     if not destination:
         # Create a temporary directory
         destination = Path(tempfile.mkdtemp())
@@ -180,6 +185,8 @@ def download_project(
     if skip_attachments:
         files = [file for file in files if not file["is_attachment"]]
 
+    logging.info("Downloading project files…")
+
     client.download_files(
         files,
         project_id,
@@ -190,6 +197,8 @@ def download_project(
         show_progress=False,
     )
 
+    logging.info("Downloading project files finished!")
+
     list_local_files(project_id, working_dir)
 
     return destination
@@ -198,6 +207,9 @@ def download_project(
 def upload_package(project_id: str, package_dir: Path) -> None:
     client = sdk.Client()
     list_local_files(project_id, package_dir)
+
+    logging.info("Uploading packaged project files…")
+
     client.upload_files(
         project_id,
         sdk.FileTransferType.PACKAGE,
@@ -208,11 +220,16 @@ def upload_package(project_id: str, package_dir: Path) -> None:
         job_id=JOB_ID,
     )
 
+    logging.info("Uploading packaged project files finished!")
+
 
 def upload_project(project_id: str, project_dir: Path) -> None:
     """Upload the files from the `project_dir` to the permanent file storage."""
     client = sdk.Client()
     list_local_files(project_id, project_dir)
+
+    logging.info("Uploading project files…")
+
     client.upload_files(
         project_id,
         sdk.FileTransferType.PROJECT,
@@ -222,9 +239,14 @@ def upload_project(project_id: str, project_dir: Path) -> None:
         show_progress=False,
     )
 
+    logging.info("Uploading packaged project files finished!")
+
 
 def list_local_files(project_id: str, project_dir: Path):
     client = sdk.Client()
+
+    logging.info("Getting project files list…")
+
     files = client.list_local_files(str(project_dir), "*")
     if files:
         logging.info(
@@ -512,7 +534,29 @@ def run_workflow(
 
     except Exception as err:
         feedback["error"] = str(err)
+
+        if isinstance(err, sdk.QfcRequestException):
+            status_code = err.response.status_code
+
+            if status_code == 401:
+                feedback["error_type"] = "API_TOKEN_EXPIRED"
+            elif status_code == 402:
+                feedback["error_type"] = "API_PAYMENT_REQUIRED"
+            elif status_code == 403:
+                feedback["error_type"] = "API_FORBIDDEN"
+            elif status_code == 404:
+                feedback["error_type"] = "API_NOT_FOUND"
+            elif status_code == 500:
+                feedback["error_type"] = "API_INTERNAL_SERVER_ERROR"
+            else:
+                feedback["error_type"] = "API_OTHER"
+        elif isinstance(err, FileNotFoundError):
+            feedback["error_type"] = "FILE_NOT_FOUND"
+        else:
+            feedback["error_type"] = "UNKNOWN"
+
         (_type, _value, tb) = sys.exc_info()
+        feedback["error_class"] = type(err).__name__
         feedback["error_stack"] = traceback.format_tb(tb)
     finally:
         feedback["steps"] = []
@@ -536,16 +580,14 @@ def run_workflow(
 
             feedback["steps"].append(step_feedback)
 
-        if feedback_filename in [sys.stderr, sys.stdout]:
-            print("Feedback:")
-            print(
-                json.dump(
-                    feedback,
-                    feedback_filename,
-                    indent=2,
-                    sort_keys=True,
-                    default=json_default,
-                )
+        if isinstance(feedback_filename, io.IOBase):
+            feedback_filename.write("Feedback:")
+            json.dump(
+                feedback,
+                feedback_filename,
+                indent=2,
+                sort_keys=True,
+                default=json_default,
             )
         elif isinstance(feedback_filename, Path):
             with open(feedback_filename, "w") as f:
@@ -561,6 +603,11 @@ def get_layers_data(project: QgsProject) -> Dict[str, Dict]:
         error = layer.error()
         layer_id = layer.id()
         layer_source = LayerSource(layer)
+        datasource = None
+
+        if layer.dataProvider():
+            datasource = layer.dataProvider().uri().uri()
+
         layers_by_id[layer_id] = {
             "id": layer_id,
             "name": layer.name(),
@@ -574,16 +621,19 @@ def get_layers_data(project: QgsProject) -> Dict[str, Dict]:
                 "QFieldSync/is_geometry_locked"
             ),
             "qfs_photo_naming": layer.customProperty("QFieldSync/photo_naming"),
+            "qfc_source_data_pk_name": layer_source.pk_attr_name,
+            "qfs_unsupported_source_pk": layer.customProperty(
+                "QFieldSync/unsupported_source_pk"
+            ),
             "is_valid": layer.isValid(),
-            "datasource": layer.dataProvider().uri().uri()
-            if layer.dataProvider()
-            else None,
+            "datasource": datasource,
             "type": layer.type(),
             "type_name": layer.type().name,
             "error_code": "no_error",
             "error_summary": error.summary() if error.messageList() else "",
             "error_message": layer.error().message(),
             "filename": layer_source.filename,
+            "provider_name": None,
             "provider_error_summary": None,
             "provider_error_message": None,
         }
@@ -610,6 +660,8 @@ def get_layers_data(project: QgsProject) -> Dict[str, Dict]:
             layers_by_id[layer_id][
                 "provider_error_message"
             ] = data_provider_error.message()
+
+            layers_by_id[layer_id]["provider_name"] = data_provider.name()
 
             if not layers_by_id[layer_id]["provider_error_summary"]:
                 service = data_provider.uri().service()
@@ -651,8 +703,10 @@ def get_file_md5sum(filename: str) -> str:
     hasher = hashlib.md5()
 
     with open(filename, "rb") as f:
-        while chunk := f.read(BLOCKSIZE):
+        chunk = f.read(BLOCKSIZE)
+        while chunk:
             hasher.update(chunk)
+            chunk = f.read(BLOCKSIZE)
 
     return hasher.hexdigest()
 
@@ -727,8 +781,10 @@ class RedactingFormatter(logging.Formatter):
         if isinstance(record.args, dict):
             for k in record.args.keys():
                 record.args[k] = self.redact(record.args[k])
+        elif isinstance(record.args, tuple):
+            record.args = tuple(self.redact(str(arg)) for arg in record.args)
         else:
-            record.args = tuple(self.redact(arg) for arg in record.args)
+            raise NotImplementedError(f"Not implemented for {type(record.args)}")
 
         return self.redact(msg)
 

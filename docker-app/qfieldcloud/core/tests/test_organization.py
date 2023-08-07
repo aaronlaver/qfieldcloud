@@ -16,7 +16,7 @@ from qfieldcloud.core.models import (
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .utils import setup_subscription_plans
+from .utils import set_subscription, setup_subscription_plans
 
 logging.disable(logging.CRITICAL)
 
@@ -37,6 +37,12 @@ class QfcTestCase(APITestCase):
         self.user3 = Person.objects.create_user(username="user3", password="abc123")
         self.token3 = AuthToken.objects.get_or_create(user=self.user3)[0]
 
+        # Create a staff user
+        self.user4 = Person.objects.create_user(
+            username="user4", password="abc123", is_staff=True
+        )
+        self.token4 = AuthToken.objects.get_or_create(user=self.user4)[0]
+
         # Create an organization
         self.organization1 = Organization.objects.create(
             username="organization1",
@@ -44,6 +50,9 @@ class QfcTestCase(APITestCase):
             type=2,
             organization_owner=self.user1,
         )
+
+        # Activate Subscriptions
+        set_subscription(self.organization1, "default_org")
 
     def test_list_members(self):
 
@@ -184,6 +193,11 @@ class QfcTestCase(APITestCase):
             member=self.user3,
             role=OrganizationMember.Roles.MEMBER,
         )
+        OrganizationMember.objects.create(
+            organization=self.organization1,
+            member=self.user4,
+            role=OrganizationMember.Roles.MEMBER,
+        )
 
         # Create a project owned by the organization
         project1 = Project.objects.create(name="p1", owner=self.organization1)
@@ -206,7 +220,7 @@ class QfcTestCase(APITestCase):
         # Initially, there is no billable user
         self.assertEqual(_active_users_count(), 0)
 
-        # User 1 creates a job
+        # user2 creates a job
         Job.objects.create(
             project=project1,
             created_by=self.user2,
@@ -214,29 +228,38 @@ class QfcTestCase(APITestCase):
         # There is now 1 billable user
         self.assertEqual(_active_users_count(), 1)
 
-        # User 1 creates a delta
+        # user2 creates a delta
         Delta.objects.create(
             deltafile_id=uuid.uuid4(),
             project=project1,
             content="delta",
+            client_id=uuid.uuid4(),
             created_by=self.user2,
         )
         # There is still 1 billable user
         self.assertEqual(_active_users_count(), 1)
 
-        # User 2 creates a job
+        # user3 creates a job
         Job.objects.create(
             project=project1,
             created_by=self.user3,
         )
-        # There is 2 billable user
+        # There are 2 billable users
         self.assertEqual(_active_users_count(), 2)
 
-        # User 2 leaves the organization
+        # user3 leaves the organization
         OrganizationMember.objects.filter(member=self.user3).delete()
 
-        # There are strill 2 billable user
+        # There are still 2 billable users
         self.assertEqual(_active_users_count(), 2)
 
         # Report at a different time is empty
         self.assertEqual(_active_users_count(now() + timedelta(days=365)), 0)
+
+        # user4 creates a job
+        Job.objects.create(
+            project=project1,
+            created_by=self.user4,
+        )
+        # There are still 2 billable users, because user4 is staff
+        self.assertEqual(_active_users_count(), 2)

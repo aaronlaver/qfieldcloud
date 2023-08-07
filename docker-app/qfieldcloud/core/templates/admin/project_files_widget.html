@@ -18,12 +18,13 @@
                     <th>{% trans 'Filename' %}</th>
                     <th>{% trans 'Last modified' %}</th>
                     <th class="qfc-admin-project-files-text-right">{% trans 'Last size' %}</th>
-                    <th>{% trans 'Version' %}</th>
+                    <th>{% trans 'Details' %}</th>
+                    <th>{% trans 'File version' %}</th>
                     <th>{% trans 'Actions' %}</th>
                 </tr>
             </thead>
             <tbody>
-                <tr><td colspan="5">{% trans 'Click the "Refresh Files List" button to get the files list.' %}</td></tr>
+                <tr><td colspan="6">{% trans 'Click the "Refresh Files List" button to get the files list.' %}</td></tr>
 
                 <template class="qfc-admin-project-files-table-loading-row-template">
                     <tr><td colspan="5">{% trans 'Loading...' %}</td></tr>
@@ -43,13 +44,15 @@
                         <td></td>
                         <td class="qfc-admin-project-files-text-right"></td>
                         <td>
+                            <button type="button" class="qfc-admin-projects-files-actions-info-btn">{% trans 'Details' %}</button>
+                        </td>
+                        <td>
                             <select>
-                                <option value="">{% trans 'Download latest/Delete all version(s)' %}</option>
+                                <option value="">{% trans 'Select a version...' %}</option>
                             </select>
                         </td>
                         <td>
-                            <button type="button" class="qfc-admin-projects-files-actions-info-btn">{% trans 'Info' %}</button>
-                            <button type="button" class="qfc-admin-projects-files-actions-download-btn">{% trans 'Download' %}</button>
+                            <button type="button" class="qfc-admin-projects-files-actions-download-btn" title="{% trans 'Download the selected version or, by default the latest' %}">{% trans 'Download' %}</button>
                             <button type="button" class="qfc-admin-projects-files-actions-delete-btn" data-csrf-token="">{% trans 'Delete' %}</button>
                         </td>
                     </tr>
@@ -164,10 +167,23 @@
             const refreshFiles = () => {
                 refreshTableContents({ isLoading: true });
 
-                return apiCall(`files/${projectId}/`)
+                const params = {
+                    skip_metadata: "1",
+                };
+                return apiCall(`files/${projectId}/`, { params })
                     .then((resp) => resp.json())
                     .then((files) => refreshTableContents({ files }))
                     .catch((error) => refreshTableContents({ error }));
+            };
+            const filesize10 = n => {
+                switch(true) {
+                    case n < 10 ** 6:
+                        return (n / 10 ** 3).toFixed(3) + " KB";
+                    case n < 10 ** 9:
+                        return (n / 10 ** 6).toFixed(3) + " MB";
+                    default:
+                        return (n / 10 ** 9).toFixed(3) + " GB";
+                }
             };
             const refreshTableContents = ({ error, isLoading = false, files = [] }) => {
                 $tbody.innerHTML = '';
@@ -196,7 +212,7 @@
 
                         $trow.querySelector('td:nth-child(1)').innerHTML = file.name;
                         $trow.querySelector('td:nth-child(2)').innerHTML = file.last_modified;
-                        $trow.querySelector('td:nth-child(3)').innerHTML = file.size;
+                        $trow.querySelector('td:nth-child(3)').innerHTML = `<span title="${file.size} bytes">${filesize10(file.size)} KB</span>`;
 
                         for (const version of file.versions) {
                             const $option = document.createElement('option');
@@ -220,9 +236,14 @@
                         });
 
                         $downloadBtn.addEventListener('click', () => {
-                            window.open(buildApiUrl(`files/${projectId}/${file.name}/`, {
-                                version: $versionsSelect.value,
-                            }));
+                            const pathToFile = `files/${projectId}/${file.name}/`;
+                            // selected or most recent file version
+                            const version = $versionsSelect.value || (
+                                file.versions
+                                    .map(obj => obj.version_id)
+                                    .sort((a, b) => String(b).localeCompare(String(a)))[0]
+                            );
+                            window.open(buildApiUrl(pathToFile, { version }));
                         });
 
                         $deleteBtn.addEventListener('click', () => {

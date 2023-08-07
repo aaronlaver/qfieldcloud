@@ -14,7 +14,7 @@ from qfieldcloud.core.models import (
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from .utils import setup_subscription_plans
+from .utils import set_subscription, setup_subscription_plans
 
 logging.disable(logging.CRITICAL)
 
@@ -53,6 +53,9 @@ class QfcTestCase(APITestCase):
             user_agent="qfield|dev",
         )[0]
 
+        # Activate Subscriptions
+        set_subscription((self.user1, self.user2, self.user3), "default_user")
+
         # Create an organization
         self.organization1 = Organization.objects.create(
             username="organization1",
@@ -64,6 +67,9 @@ class QfcTestCase(APITestCase):
         self.project1 = Project.objects.create(
             name="project1", is_public=False, owner=self.user1
         )
+
+        # Activate Subscriptions
+        set_subscription(self.organization1, "default_org")
 
         # Set user2 as member of organization1
         OrganizationMember.objects.create(
@@ -305,11 +311,11 @@ class QfcTestCase(APITestCase):
 
         organization = payload[0]
 
-        self.assertEquals(organization["username"], self.organization1.username)
-        self.assertEquals(organization["type"], User.Type.ORGANIZATION)
-        self.assertEquals(organization["membership_role"], "admin")
-        self.assertEquals(organization["membership_role_origin"], "organization_owner")
-        self.assertEquals(organization["membership_is_public"], True)
+        self.assertEqual(organization["username"], self.organization1.username)
+        self.assertEqual(organization["type"], User.Type.ORGANIZATION)
+        self.assertEqual(organization["membership_role"], "admin")
+        self.assertEqual(organization["membership_role_origin"], "organization_owner")
+        self.assertEqual(organization["membership_is_public"], True)
 
     def test_duplicate_user_emails(self):
         Person.objects.create_user(

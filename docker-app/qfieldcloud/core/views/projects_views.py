@@ -1,12 +1,16 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.utils.decorators import method_decorator
-from drf_yasg import openapi
-from drf_yasg.utils import swagger_auto_schema
-from qfieldcloud.core import exceptions, permissions_utils
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
+from qfieldcloud.core import pagination, permissions_utils
 from qfieldcloud.core.models import Project, ProjectQueryset
 from qfieldcloud.core.serializers import ProjectSerializer
 from qfieldcloud.core.utils2 import storage
+from qfieldcloud.subscription.exceptions import QuotaError
 from rest_framework import generics, permissions, viewsets
 
 User = get_user_model()
@@ -42,68 +46,39 @@ class ProjectViewSetPermissions(permissions.BasePermission):
         return False
 
 
-include_public_param = openapi.Parameter(
-    "include-public",
-    openapi.IN_QUERY,
-    description="Include public projects",
-    type=openapi.TYPE_BOOLEAN,
-)
-
-
-@method_decorator(
-    name="retrieve",
-    decorator=swagger_auto_schema(
-        operation_description="Get a project",
-        operation_id="Get a project",
-    ),
-)
-@method_decorator(
-    name="update",
-    decorator=swagger_auto_schema(
-        operation_description="Update a project",
-        operation_id="Update a project",
-    ),
-)
-@method_decorator(
-    name="partial_update",
-    decorator=swagger_auto_schema(
-        operation_description="Patch a project",
-        operation_id="Patch a project",
-    ),
-)
-@method_decorator(
-    name="destroy",
-    decorator=swagger_auto_schema(
-        operation_description="Delete a project",
-        operation_id="Delete a project",
-    ),
-)
-@method_decorator(
-    name="list",
-    decorator=swagger_auto_schema(
-        operation_description="""List projects owned by the authenticated
+@extend_schema_view(
+    retrieve=extend_schema(description="Retrieve a project"),
+    update=extend_schema(description="Update a project"),
+    partial_update=extend_schema(description="Partially update a project"),
+    destroy=extend_schema(description="Delete a project"),
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="include-public",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                default=0,
+                enum=[1, 0],
+                description="Include public projects",
+            ),
+        ],
+        description="""List projects owned by the authenticated
         user or that the authenticated user has explicit permission to access
         (i.e. she is a project collaborator)""",
-        operation_id="List projects",
-        manual_parameters=[include_public_param],
     ),
-)
-@method_decorator(
-    name="create",
-    decorator=swagger_auto_schema(
-        operation_description="""Create a new project owned by the specified
-        user or organization""",
-        operation_id="Create a project",
+    create=extend_schema(
+        description="""Create a new project owned by the specified
+        user or organization"""
     ),
 )
 class ProjectViewSet(viewsets.ModelViewSet):
-
     serializer_class = ProjectSerializer
     lookup_url_kwarg = "projectid"
     permission_classes = [permissions.IsAuthenticated, ProjectViewSetPermissions]
+    pagination_class = pagination.QfcLimitOffsetPagination()
 
     def get_queryset(self):
-
         projects = Project.objects.for_user(self.request.user)
 
         # In the list endpoint, by default we filter out public projects. They can be
@@ -141,12 +116,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
         # Owner has changed, we must ensure he has enough quota for that
         # (in this transaction, the project is his already, so we just need to
         # check his quota)
-        if new_owner.useraccount.storage_free_mb < 0:
+        if new_owner.useraccount.storage_free_bytes < 0:
             # If not, we rollback the transaction
             # (don't give away numbers in message as it's potentially private)
-            raise exceptions.QuotaError(
-                "Project storage too large for recipient's quota."
-            )
+            raise QuotaError("Project storage too large for recipient's quota.")
 
     def destroy(self, request, projectid):
         # Delete files from storage
@@ -155,17 +128,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return super().destroy(request, projectid)
 
 
-@method_decorator(
-    name="get",
-    decorator=swagger_auto_schema(
-        operation_description="List public projects",
-        operation_id="List public projects",
-    ),
-)
+@extend_schema_view(get=extend_schema(description="List all public projects"))
 class PublicProjectsListView(generics.ListAPIView):
-
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ProjectSerializer
+    pagination_class = pagination.QfcLimitOffsetPagination()
 
     def get_queryset(self):
         return Project.objects.for_user(self.request.user).filter(is_public=True)

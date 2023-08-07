@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import time
+from unittest import mock, skip
 
 import fiona
 import rest_framework
@@ -9,6 +10,7 @@ from django.http.response import FileResponse, HttpResponse
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core import utils
 from qfieldcloud.core.models import (
+    Delta,
     Job,
     Organization,
     OrganizationMember,
@@ -16,8 +18,10 @@ from qfieldcloud.core.models import (
     Project,
     ProjectCollaborator,
 )
+from qfieldcloud.subscription.models import Subscription
 from rest_framework import status
 from rest_framework.test import APITransactionTestCase
+from shapely.geometry import shape
 
 from .utils import get_filename, setup_subscription_plans, testdata_path
 
@@ -25,6 +29,13 @@ logging.disable(logging.CRITICAL)
 
 
 class QfcTestCase(APITransactionTestCase):
+    layer_id_map = {
+        "polygons_f18b6046_8e46_4206_a698_641c58e5ac73": "polygons",
+        "points_xy_897d5ed7_b810_4624_abe3_9f7c0a93d6a1": "points_xy",
+        "points_xyz_ff574332_1ff5_47e6_8d6a_15f68e0c7cd1": "points_xyz",
+        "points_xyzm_1cb6363a_5a99_4090_aeaf_d88deec2a3d8": "points_xyzm",
+    }
+
     def setUp(self):
         setup_subscription_plans()
 
@@ -179,7 +190,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, layer="points") as layer:
+        with fiona.open(gpkg, layer="points_xy") as layer:
             features = list(layer)
             self.assertEqual(666, features[0]["properties"]["int"])
 
@@ -201,7 +212,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, layer="points") as layer:
+        with fiona.open(gpkg, layer="points_xy") as layer:
             features = list(layer)
             self.assertEqual(666, features[0]["properties"]["int"])
 
@@ -223,7 +234,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, layer="points") as layer:
+        with fiona.open(gpkg, layer="points_xy") as layer:
             features = list(layer)
             self.assertEqual("", features[0]["properties"]["str"])
 
@@ -272,7 +283,7 @@ class QfcTestCase(APITransactionTestCase):
 
         response = self.client.post(
             f"/api/v1/deltas/{project.id}/",
-            {"file": open(delta_file, "r")},
+            {"file": open(delta_file)},
             format="multipart",
         )
 
@@ -313,7 +324,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, layer="points") as layer:
+        with fiona.open(gpkg, layer="points_xy") as layer:
             features = list(layer)
             self.assertEqual(666, features[0]["properties"]["int"])
 
@@ -467,7 +478,41 @@ class QfcTestCase(APITransactionTestCase):
         json = response.json()
         self.assertEqual(json["code"], "object_not_found")
 
+    def test_push_delta_allowed_for_insufficient_subscription(self):
+        """
+        Test that deltas can always be pushed, even if project has
+        unsoppurted online layer or owner (token3) is inactive or over qouta .
+        """
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token3.key)
+        project = self.upload_project_files(self.project1)
+
+        with mock.patch.object(
+            Project, "has_online_vector_data", new_callable=mock.PropertyMock
+        ) as mock_has_online_vector_data:
+            mock_has_online_vector_data.return_value = True
+            self.assertTrue(project.has_online_vector_data)
+            subscription = project.owner.useraccount.current_subscription
+            subscription.status = Subscription.Status.INACTIVE_DRAFT
+            subscription.save()
+
+            plan = subscription.plan
+            # Make sure the user's plan is inactive and does not allow online vector data
+            self.assertFalse(project.owner.useraccount.current_subscription.is_active)
+            self.assertFalse(plan.is_external_db_supported)
+
+            # Make project use all available storage
+            project.file_storage_bytes = (plan.storage_mb * 1000 * 1000) + 1
+            project.save()
+
+            # Check can still upload deltas
+            self.assertTrue(self.upload_deltas(project, "singlelayer_singledelta.json"))
+            delta = Delta.objects.latest("created_at")
+            self.assertEqual(delta.last_status, Delta.Status.PENDING)
+            # No apply job is created
+            self.assertEqual(delta.jobs_to_apply.count(), 0)
+
     def test_push_delta_not_allowed(self):
+        # Check collaborator with Role REPORTER cannot push a delta of a modified feature (PATCH)
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token2.key)
         project = self.upload_project_files(self.project1)
 
@@ -489,6 +534,210 @@ class QfcTestCase(APITransactionTestCase):
             ],
         )
 
+    def test_delta_with_xy_for_xyz_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xy_for_xyz_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    def test_delta_with_xyz_for_xyz_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyz_for_xyz_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    def test_delta_with_xyz_nan_for_xyz_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyz_nan_for_xyz_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xy_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xy_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xyz_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyz_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xyz_nan_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyz_nan_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xyzm_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyzm_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xyzm_nan_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyzm_nan_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
+    @skip("Enable when Fiona and Shapely support Z and M dimensions")
+    def test_delta_with_xyzm_nannan_for_xyzm_layer(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="singlelayer_multidelta_delta_with_xyzm_nannan_for_xyzm_layer.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "736bf2c2-646a-41a2-8c55-28c26aecd68d",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "8adac0df-e1d3-473e-b150-f8c4a91b4781",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
+        )
+
     def test_non_spatial_delta(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
         project = self.upload_project_files(self.project1)
@@ -505,6 +754,11 @@ class QfcTestCase(APITransactionTestCase):
                     self.user1.username,
                 ],
                 [
+                    "6c127828-b072-4939-a955-2018175748ac",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
                     "f326c3c1-138f-4261-9151-4946237ce714",
                     "STATUS_APPLIED",
                     self.user1.username,
@@ -513,7 +767,33 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         self.assertEqual(
-            self.get_file_contents(project, "nonspatial.csv"), b'fid,col1\n"1",qux\n'
+            self.get_file_contents(project, "nonspatial.csv"),
+            b'fid,col1\n"1",qux\n"2",newfeature\n',
+        )
+
+    def test_special_data_types(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+        project = self.upload_project_files(self.project1)
+        project.overwrite_conflicts = False
+        project.save()
+
+        # Push a deltafile
+        self.upload_and_check_deltas(
+            project=project,
+            delta_filename="special_data_types.json",
+            token=self.token1.key,
+            final_values=[
+                [
+                    "1270b97d-6a28-49cc-83f3-b827ec574fee",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+                [
+                    "6c127828-b072-4939-a955-2018175748ac",
+                    "STATUS_APPLIED",
+                    self.user1.username,
+                ],
+            ],
         )
 
     def test_delta_pushed_after_job_triggered(self):
@@ -623,7 +903,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 4)
@@ -647,7 +927,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 5)
@@ -672,7 +952,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 5)
@@ -697,7 +977,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 5)
@@ -722,7 +1002,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 4)
@@ -746,7 +1026,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         gpkg = io.BytesIO(self.get_file_contents(project, "testdata.gpkg"))
-        with fiona.open(gpkg, "r", layer="points") as layer:
+        with fiona.open(gpkg, "r", layer="points_xy") as layer:
             features = list(layer)
 
             self.assertEqual(len(features), 3)
@@ -767,7 +1047,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def get_delta_file_with_project_id(self, project, delta_filename):
         """Retrieves a delta json file with the project id replaced by the project.id"""
-        with open(delta_filename, "r") as f:
+        with open(delta_filename) as f:
             deltafile = json.load(f)
             deltafile["project"] = str(project.id)
             json_str = json.dumps(deltafile)
@@ -865,8 +1145,11 @@ class QfcTestCase(APITransactionTestCase):
 
             self.assertEqual(len(payload), len(final_values))
 
+            applied_delta_ids = []
+            still_waiting = False
             for idx, final_value in enumerate(final_values):
                 if payload[idx]["status"] in wait_status:
+                    still_waiting = True
                     break
 
                 if payload[idx]["status"] in failing_status:
@@ -877,11 +1160,67 @@ class QfcTestCase(APITransactionTestCase):
                 delta_id, status, created_by = final_value
                 status = status if isinstance(status, list) else [status]
 
-                self.assertEqual(payload[idx]["id"], delta_id)
-                self.assertIn(payload[idx]["status"], status)
-                self.assertEqual(payload[idx]["created_by"], created_by)
+                try:
+                    self.assertEqual(payload[idx]["id"], delta_id)
+                    self.assertIn(payload[idx]["status"], status)
+                    self.assertEqual(payload[idx]["created_by"], created_by)
 
-                if len(final_values) == idx + 1:
-                    return
+                    if payload[idx]["status"] == "STATUS_APPLIED":
+                        applied_delta_ids.append(delta_id)
+                except Exception as err:
+                    print(
+                        "Failed payload:\n",
+                        json.dumps(payload[idx], sort_keys=True, indent=2),
+                    )
+                    for job in Job.objects.all():
+                        job = Job.objects.latest("updated_at")
+                        print("Job:\n", job.type, job.status)
+                        print("Output:\n", job.output)
+                        print(
+                            "Feedback:\n",
+                            json.dumps(job.feedback, sort_keys=True, indent=2),
+                        )
+                    raise err
+
+            if not still_waiting:
+                for idx, delta_id in enumerate(applied_delta_ids):
+                    delta = Delta.objects.get(id=delta_id)
+
+                    layer_id = delta.content["sourceLayerId"]
+                    layer_name = self.layer_id_map.get(layer_id)
+
+                    if layer_name is None:
+                        continue
+
+                    layer = fiona.open(
+                        io.BytesIO(self.get_file_contents(project, "testdata.gpkg")),
+                        layer=layer_name,
+                    )
+
+                    if delta.content["method"] in ("create", "patch"):
+                        fid = delta.last_modified_pk
+                        matched_features = list(filter(lambda f: f.id == fid, layer))
+
+                        if len(matched_features) == 0:
+                            self.fail(
+                                f"No feature found in the resulting gpkg: {fid=} {layer_name=} {layer_id=} "
+                            )
+                        elif len(matched_features) > 1:
+                            self.fail(
+                                f"More than one feature found in the resulting gpkg: {fid=} {layer_name=} {layer_id=} "
+                            )
+
+                        f = matched_features[0]
+                        new = delta.content["new"]
+
+                        if "geometry" in new:
+                            new_geometry_wkt = new["geometry"].replace("nan", "0")
+                            # shapely's WKT is `POINT Z` instead of QGIS "POINTZ"
+                            shapely_wkt = shape(f.geometry).wkt.replace(
+                                "POINT Z", "POINTZ"
+                            )
+                            self.assertEqual(shapely_wkt, new_geometry_wkt)
+
+                return
 
         self.fail("Worker didn't finish", job=job)

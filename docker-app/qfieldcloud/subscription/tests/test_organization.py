@@ -1,6 +1,5 @@
 import logging
 
-from django.core.exceptions import ValidationError
 from qfieldcloud.authentication.models import AuthToken
 from qfieldcloud.core.models import (
     Organization,
@@ -12,6 +11,7 @@ from qfieldcloud.core.models import (
     Team,
 )
 from qfieldcloud.core.tests.utils import set_subscription, setup_subscription_plans
+from qfieldcloud.subscription.exceptions import ReachedMaxOrganizationMembersError
 from rest_framework.test import APITransactionTestCase
 
 logging.disable(logging.CRITICAL)
@@ -77,7 +77,7 @@ class QfcTestCase(APITransactionTestCase):
         u8 = Person.objects.create(username="u8")
 
         org01 = Organization.objects.create(username="org01", organization_owner=u1)
-        subscription = org01.useraccount.active_subscription
+        subscription = org01.useraccount.current_subscription
         set_subscription(org01, is_premium=True)
         subscription.save()
         org01.members.create(member=u2, role=OrganizationMember.Roles.ADMIN)
@@ -235,7 +235,7 @@ class QfcTestCase(APITransactionTestCase):
         set_subscription(o, "plus1", max_organization_members=1)
 
         # cannot add a new member
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(ReachedMaxOrganizationMembersError):
             OrganizationMember.objects.create(member=u4, organization=o)
 
     def test_max_organization_members_raises_when_adding_new_member_over_limit(self):
@@ -248,5 +248,5 @@ class QfcTestCase(APITransactionTestCase):
 
         OrganizationMember.objects.create(member=u2, organization=o)
 
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(ReachedMaxOrganizationMembersError):
             OrganizationMember.objects.create(member=u3, organization=o)

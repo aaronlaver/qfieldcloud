@@ -15,6 +15,7 @@ from qfieldcloud.core.models import (
     Job,
     Organization,
     OrganizationMember,
+    PackageJob,
     Person,
     Project,
     ProjectCollaborator,
@@ -22,10 +23,11 @@ from qfieldcloud.core.models import (
     Team,
     TeamMember,
 )
+from qfieldcloud.core.utils2.storage import get_stored_package_ids
 from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
-from .utils import setup_subscription_plans, testdata_path
+from .utils import setup_subscription_plans, testdata_path, wait_for_project_ok_status
 
 logging.disable(logging.CRITICAL)
 
@@ -43,10 +45,7 @@ class QfcTestCase(APITransactionTestCase):
             name="project1", is_public=False, owner=self.user1
         )
 
-        try:
-            delete_db_and_role("test", self.user1.username)
-        except Exception:
-            pass
+        delete_db_and_role("test", self.user1.username)
 
         self.geodb = Geodb.objects.create(
             user=self.user1,
@@ -84,39 +83,6 @@ class QfcTestCase(APITransactionTestCase):
                 format="multipart",
             )
             self.assertTrue(status.is_success(response.status_code))
-
-    def wait_for_project_ok_status(self, project: Project, wait_s: int = 30):
-        jobs = Job.objects.filter(project=project).exclude(
-            status__in=[Job.Status.FAILED, Job.Status.FINISHED]
-        )
-
-        if jobs.count() == 0:
-            return
-
-        has_no_pending_jobs = False
-        for _ in range(wait_s):
-            if (
-                Job.objects.filter(project=project, status=Job.Status.PENDING).count()
-                == 0
-            ):
-                has_no_pending_jobs = True
-
-            time.sleep(1)
-
-        if not has_no_pending_jobs:
-            self.fail(f"Still pending jobs after waiting for {wait_s} seconds")
-
-        for _ in range(wait_s):
-            project.refresh_from_db()
-            if project.status == Project.Status.OK:
-                return
-            if project.status == Project.Status.FAILED:
-                self.fail("Waited for ok status, but got failed")
-                return
-
-            time.sleep(1)
-
-        self.fail(f"Waited for ok status for {wait_s} seconds")
 
     def upload_files_and_check_package(
         self,
@@ -170,6 +136,7 @@ class QfcTestCase(APITransactionTestCase):
             payload = response.json()
 
             if payload["status"] == Job.Status.FINISHED:
+                project.refresh_from_db()
                 response = self.client.get(f"/api/v1/packages/{project.id}/latest/")
                 package_payload = response.json()
 
@@ -224,7 +191,9 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_list_files_for_qfield(self):
         cur = self.conn.cursor()
-        cur.execute("CREATE TABLE point (id integer, geometry geometry(point, 2056))")
+        cur.execute(
+            "CREATE TABLE point (id integer primary key, geometry geometry(point, 2056))"
+        )
         self.conn.commit()
         cur.execute(
             "INSERT INTO point(id, geometry) VALUES(1, ST_GeomFromText('POINT(2725505 1121435)', 2056))"
@@ -292,7 +261,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         local_file = os.path.join(tempdir, "project_qfield.qgs")
-        with open(local_file, "r") as f:
+        with open(local_file) as f:
             self.assertEqual(
                 f.readline().strip(),
                 "<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>",
@@ -381,7 +350,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         local_file = os.path.join(tempdir, "project_qfield.qgs")
-        with open(local_file, "r") as f:
+        with open(local_file) as f:
             for line in f:
                 if 'name="theMapCanvas"' in line:
                     return
@@ -445,7 +414,9 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_needs_repackaging_with_online_vector(self):
         cur = self.conn.cursor()
-        cur.execute("CREATE TABLE point (id integer, geometry geometry(point, 2056))")
+        cur.execute(
+            "CREATE TABLE point (id integer primary key, geometry geometry(point, 2056))"
+        )
         self.conn.commit()
         cur.execute(
             "INSERT INTO point(id, geometry) VALUES(1, ST_GeomFromText('POINT(2725505 1121435)', 2056))"
@@ -476,7 +447,9 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_connects_via_pgservice(self):
         cur = self.conn.cursor()
-        cur.execute("CREATE TABLE point (id integer, geometry geometry(point, 2056))")
+        cur.execute(
+            "CREATE TABLE point (id integer primary key, geometry geometry(point, 2056))"
+        )
         self.conn.commit()
 
         Secret.objects.create(
@@ -519,7 +492,7 @@ class QfcTestCase(APITransactionTestCase):
             ],
         )
 
-        self.wait_for_project_ok_status(self.project1)
+        wait_for_project_ok_status(self.project1)
         self.project1.refresh_from_db()
 
         last_process_job = Job.objects.filter(type=Job.Type.PROCESS_PROJECTFILE).latest(
@@ -536,7 +509,9 @@ class QfcTestCase(APITransactionTestCase):
 
     def test_has_online_vector_data(self):
         cur = self.conn.cursor()
-        cur.execute("CREATE TABLE point (id integer, geometry geometry(point, 2056))")
+        cur.execute(
+            "CREATE TABLE point (id integer primary key, geometry geometry(point, 2056))"
+        )
         self.conn.commit()
 
         self.upload_files(
@@ -547,7 +522,7 @@ class QfcTestCase(APITransactionTestCase):
             ],
         )
 
-        self.wait_for_project_ok_status(self.project1)
+        wait_for_project_ok_status(self.project1)
 
         self.project1.refresh_from_db()
 
@@ -562,7 +537,7 @@ class QfcTestCase(APITransactionTestCase):
             ],
         )
 
-        self.wait_for_project_ok_status(self.project1)
+        wait_for_project_ok_status(self.project1)
 
         self.project1.refresh_from_db()
 
@@ -655,3 +630,60 @@ class QfcTestCase(APITransactionTestCase):
                     "project_qfield_attachments.zip",
                 ],
             )
+
+    def test_outdated_packaged_files_are_deleted(self):
+        subscription = self.user1.useraccount.current_subscription
+        subscription.plan.is_external_db_supported = True
+        subscription.plan.save()
+
+        cur = self.conn.cursor()
+        cur.execute(
+            "CREATE TABLE point (id integer primary key, geometry geometry(point, 2056))"
+        )
+        self.conn.commit()
+        cur.execute(
+            "INSERT INTO point(id, geometry) VALUES(1, ST_GeomFromText('POINT(2725505 1121435)', 2056))"
+        )
+        self.conn.commit()
+
+        self.upload_files_and_check_package(
+            token=self.token1.key,
+            project=self.project1,
+            files=[
+                ("delta/project2.qgs", "project.qgs"),
+                ("delta/points.geojson", "points.geojson"),
+            ],
+            expected_files=[
+                "data.gpkg",
+                "project_qfield.qgs",
+                "project_qfield_attachments.zip",
+            ],
+        )
+
+        old_package = PackageJob.objects.filter(project=self.project1).latest(
+            "created_at"
+        )
+        stored_package_ids = get_stored_package_ids(self.project1.id)
+        self.assertIn(str(old_package.id), stored_package_ids)
+        self.assertEqual(len(stored_package_ids), 1)
+
+        self.check_package(
+            self.token1.key,
+            self.project1,
+            [
+                "data.gpkg",
+                "project_qfield.qgs",
+                "project_qfield_attachments.zip",
+            ],
+        )
+
+        new_package = PackageJob.objects.filter(project=self.project1).latest(
+            "created_at"
+        )
+
+        stored_package_ids = get_stored_package_ids(self.project1.id)
+
+        self.assertNotEqual(old_package.id, new_package.id)
+        self.assertNotIn(str(old_package.id), stored_package_ids)
+        self.assertIn(str(new_package.id), stored_package_ids)
+        self.assertEqual(len(stored_package_ids), 1)

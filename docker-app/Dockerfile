@@ -42,7 +42,11 @@ ENV PIP_NO_CACHE_DIR 1
 # install dependencies
 RUN apt update && apt-get install -y \
 # GeoDjango as recommended at https://docs.djangoproject.com/en/4.1/ref/contrib/gis/install/geolibs/#installing-geospatial-libraries
-    binutils libproj-dev gdal-bin
+    binutils libproj-dev gdal-bin \
+# needed for Django's `manage.py makemessages`
+    gettext \
+# for development purposes only (optional dependency for `django-extensions`)
+    graphviz
 
 # copy the dependencies
 COPY --from=build /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
@@ -74,6 +78,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 # a separate stage for webserver runtime environment
 FROM base as webserver_runtime
+ENV LOGGER_SOURCE=app
 COPY ./requirements_runtime.txt .
 RUN pip3 install -r requirements_runtime.txt
 EXPOSE 8000
@@ -88,6 +93,7 @@ USER app
 
 # a separate stage for webserver test environment
 FROM base as webserver_test
+ENV LOGGER_SOURCE=app
 COPY ./requirements_test.txt .
 RUN pip3 install -r requirements_test.txt
 EXPOSE 8000
@@ -102,6 +108,7 @@ USER app
 
 # a separate stage for worker wrapper runtime environment
 FROM base as worker_wrapper_runtime
+ENV LOGGER_SOURCE=worker_wrapper
 COPY ./requirements_worker_wrapper.txt .
 RUN pip3 install -r requirements_worker_wrapper.txt
 

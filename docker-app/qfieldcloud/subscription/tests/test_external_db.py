@@ -52,7 +52,7 @@ class QfcTestCase(APITransactionTestCase):
 
     def _get_delta_file_with_project_id(self, project, delta_filename):
         """Retrieves a delta json file with the project id replaced by the project.id"""
-        with open(delta_filename, "r") as f:
+        with open(delta_filename) as f:
             deltafile = json.load(f)
             deltafile["project"] = str(project.id)
             json_str = json.dumps(deltafile)
@@ -130,6 +130,7 @@ class QfcTestCase(APITransactionTestCase):
         # When external db is NOT supported, we can NOT apply deltas
 
         Plan.objects.all().update(is_external_db_supported=False)
+        jobs_count_before = p1.jobs.count()
         response = self.client.post(
             f"/api/v1/deltas/{p1.id}/",
             {
@@ -145,5 +146,9 @@ class QfcTestCase(APITransactionTestCase):
             print(delta)
         self.assertEqual(
             Delta.objects.filter(project=p1).latest("created_at").last_status,
-            Delta.Status.UNPERMITTED,
+            Delta.Status.PENDING,
         )
+        # No Apply Job is created
+        self.assertEqual(p1.jobs.count(), jobs_count_before)
+
+        # TODO When external db is supported again apply pending deltas

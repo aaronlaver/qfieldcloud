@@ -3,7 +3,6 @@ import logging
 import tempfile
 import time
 from pathlib import PurePath
-from unittest import skip
 
 from django.core.management import call_command
 from django.http import FileResponse
@@ -57,6 +56,16 @@ class QfcTestCase(APITransactionTestCase):
         else:
             return response.content
 
+    def test_try_to_get_nonexistent_project(self):
+        empty_string = ""
+        nonexistent_id = "007"
+        with self.subTest(
+            "Ensure that '/api/v1/files' handles missing resources correctly."
+        ):
+            one = self.client.get(f"/api/v1/files/{empty_string}")
+            two = self.client.get(f"/api/v1/files/{nonexistent_id}")
+            assert all(r.status_code == 404 for r in (one, two))
+
     def test_push_file(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
@@ -68,12 +77,48 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+
+    def test_push_multiple_files(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
+        self.assertEqual(
+            Project.objects.get(pk=self.project1.pk).project_filename, None
+        )
+
+        # Upload multiple files
+        file1 = io.FileIO(testdata_path("DCIM/1.jpg"), "rb")
+        file2 = io.FileIO(testdata_path("DCIM/2.jpg"), "rb")
+        file3 = io.FileIO(testdata_path("file.txt"), "rb")
+        data = {"file": [file1, file2, file3]}
+
+        should_fail_on_multiple = self.client.post(
+            f"/api/v1/files/{self.project1.id}/file.txt/",
+            data=data,
+            format="multipart",
+        )
+        should_fail_on_empty = self.client.post(
+            f"/api/v1/files/{self.project1.id}/file.txt/",
+            data={"file": []},
+            format="multipart",
+        )
+
+        # Assert that it didn't work
+        with self.subTest():
+            self.assertEqual(
+                should_fail_on_multiple.json()["code"], "multiple_contents"
+            )
+            self.assertEqual(should_fail_on_empty.json()["code"], "empty_content")
+            self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
+            self.assertEqual(
+                Project.objects.get(pk=self.project1.pk).project_filename, None
+            )
 
     def test_push_download_file(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
@@ -86,7 +131,7 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -109,7 +154,7 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/foo/bar/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/foo/bar/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -130,7 +175,7 @@ class QfcTestCase(APITransactionTestCase):
             open(testdata_path("file.txt"), "rb").read(),
         )
 
-    def test_push_list_file(self):
+    def test_upload_and_list_file(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
         self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
@@ -141,7 +186,7 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/aaa/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/aaa/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -151,7 +196,7 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file2.txt")
         # Push a second file
         response = self.client.post(
-            "/api/v1/files/{}/file2.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file2.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -159,7 +204,7 @@ class QfcTestCase(APITransactionTestCase):
         self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 2)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
 
         json = response.json()
@@ -178,7 +223,74 @@ class QfcTestCase(APITransactionTestCase):
             "fcc85fb502bd772aa675a0263b5fa665bccd5d8d93349d1dbc9f0f6394dd37b9",
         )
 
-    def test_push_list_file_with_space_in_name(self):
+    def test_upload_and_list_file_checksum(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
+
+        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
+        self.assertEqual(
+            Project.objects.get(pk=self.project1.pk).project_filename, None
+        )
+
+        file_path = testdata_path("file.txt")
+        # Push a file
+        response = self.client.post(
+            f"/api/v1/files/{self.project1.id}/file.txt/",
+            {"file": open(file_path, "rb")},
+            format="multipart",
+        )
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+
+        # List files without `skip_metadata` param
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
+        self.assertTrue(status.is_success(response.status_code))
+
+        json = response.json()
+
+        self.assertEqual(json[0]["name"], "file.txt")
+        self.assertEqual(json[0]["size"], 13)
+        self.assertIn("sha256", json[0])
+        self.assertIn("md5sum", json[0])
+        self.assertEqual(
+            json[0]["sha256"],
+            "8663bab6d124806b9727f89bb4ab9db4cbcc3862f6bbf22024dfa7212aa4ab7d",
+        )
+        self.assertEqual(
+            json[0]["md5sum"],
+            "9af2f8218b150c351ad802c6f3d66abe",
+        )
+
+        # List files with `skip_metadata=0` param
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/?skip_metadata=0")
+        self.assertEqual(json[0]["name"], "file.txt")
+        self.assertEqual(json[0]["size"], 13)
+        self.assertIn("sha256", json[0])
+        self.assertIn("md5sum", json[0])
+        self.assertEqual(
+            json[0]["sha256"],
+            "8663bab6d124806b9727f89bb4ab9db4cbcc3862f6bbf22024dfa7212aa4ab7d",
+        )
+        self.assertEqual(
+            json[0]["md5sum"],
+            "9af2f8218b150c351ad802c6f3d66abe",
+        )
+
+        # List files with `skip_metadata=1` param
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/?skip_metadata=1")
+        self.assertTrue(status.is_success(response.status_code))
+
+        json = response.json()
+
+        self.assertEqual(json[0]["name"], "file.txt")
+        self.assertEqual(json[0]["size"], 13)
+        self.assertNotIn("sha256", json[0])
+        self.assertIn("md5sum", json[0])
+        self.assertEqual(
+            json[0]["md5sum"],
+            "9af2f8218b150c351ad802c6f3d66abe",
+        )
+
+    def test_upload_and_list_file_with_space_in_name(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
         self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
@@ -201,30 +313,35 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
 
         json = response.json()
 
         self.assertEqual(json[0]["name"], "aaa bbb/project qgis 1.2.qgs")
 
-    def test_push_list_file_versions(self):
+    def test_upload_and_list_file_versions(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
-        self.assertEqual(
-            Project.objects.get(pk=self.project1.pk).project_filename, None
-        )
+        project = Project.objects.get(pk=self.project1.pk)
+
+        self.assertEqual(project.files_count, 0)
+        self.assertEqual(project.file_storage_bytes, 0)
+        self.assertIsNone(project.project_filename)
 
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/aaa/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/aaa/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 13)
+        self.assertIsNone(project.project_filename)
 
         # Wait 2 seconds to be sure the file timestamps are different
         time.sleep(2)
@@ -233,15 +350,19 @@ class QfcTestCase(APITransactionTestCase):
         # Push another file with the same name (i.e. push another
         # version)
         response = self.client.post(
-            "/api/v1/files/{}/aaa/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/aaa/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 26)
+        self.assertIsNone(project.project_filename)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
 
         versions = sorted(
@@ -274,7 +395,7 @@ class QfcTestCase(APITransactionTestCase):
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -288,7 +409,7 @@ class QfcTestCase(APITransactionTestCase):
         # Push another file with the same name (i.e. push another
         # version)
         response = self.client.post(
-            "/api/v1/files/{}/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
@@ -306,7 +427,7 @@ class QfcTestCase(APITransactionTestCase):
         )
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
 
         versions = sorted(
@@ -332,45 +453,56 @@ class QfcTestCase(APITransactionTestCase):
     def test_push_delete_file(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
 
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 0)
-        self.assertEqual(
-            Project.objects.get(pk=self.project1.pk).project_filename, None
-        )
+        project = Project.objects.get(pk=self.project1.pk)
+
+        self.assertEqual(project.files_count, 0)
+        self.assertEqual(project.file_storage_bytes, 0)
+        self.assertIsNone(project.project_filename)
 
         file_path = testdata_path("file.txt")
         # Push a file
         response = self.client.post(
-            "/api/v1/files/{}/aaa/file.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/aaa/file.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 13)
+        self.assertIsNone(project.project_filename)
 
         file_path = testdata_path("file2.txt")
         # Push a second file
         response = self.client.post(
-            "/api/v1/files/{}/file2.txt/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/file2.txt/",
             {"file": open(file_path, "rb")},
             format="multipart",
         )
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 2)
+        self.assertEqual(project.files_count, 2)
+        self.assertEqual(project.file_storage_bytes, 26)
+        self.assertIsNone(project.project_filename)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.json()), 2)
 
         # Delete a file
-        response = self.client.delete(
-            "/api/v1/files/{}/aaa/file.txt/".format(self.project1.id)
-        )
+        response = self.client.delete(f"/api/v1/files/{self.project1.id}/aaa/file.txt/")
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 13)
+        self.assertIsNone(project.project_filename)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.json()), 1)
 
@@ -432,7 +564,7 @@ class QfcTestCase(APITransactionTestCase):
 
         # Push another QGIS project file
         response = self.client.post(
-            "/api/v1/files/{}/foo/bar/file2.qgz/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/foo/bar/file2.qgz/",
             {
                 "file": open(file_path, "rb"),
             },
@@ -464,25 +596,27 @@ class QfcTestCase(APITransactionTestCase):
 
         big_file = tempfile.NamedTemporaryFile()
         with open(big_file.name, "wb") as bf:
-            bf.truncate(1024 * 1024 * 1)
+            bf.truncate(1000 * 1000 * 1)
 
         # Push the file
         response = self.client.post(
-            "/api/v1/files/{}/bigfile.big/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/bigfile.big/",
             data={"file": open(big_file.name, "rb")},
             format="multipart",
         )
+        project = Project.objects.get(pk=self.project1.pk)
+
         self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 1000000)
 
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
 
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.json()), 1)
         self.assertEqual("bigfile.big", response.json()[0]["name"])
-        self.assertGreater(response.json()[0]["size"], 1000000)
-        self.assertLess(response.json()[0]["size"], 1100000)
+        self.assertEqual(response.json()[0]["size"], 1000000)
 
     def test_upload_10mb_file(self):
         self.client.credentials(HTTP_AUTHORIZATION="Token " + self.token1.key)
@@ -494,25 +628,26 @@ class QfcTestCase(APITransactionTestCase):
 
         big_file = tempfile.NamedTemporaryFile()
         with open(big_file.name, "wb") as bf:
-            bf.truncate(1024 * 1024 * 10)
+            bf.truncate(1000 * 1000 * 10)
 
         # Push the file
         response = self.client.post(
-            "/api/v1/files/{}/bigfile.big/".format(self.project1.id),
+            f"/api/v1/files/{self.project1.id}/bigfile.big/",
             data={"file": open(big_file.name, "rb")},
             format="multipart",
         )
-        self.assertTrue(status.is_success(response.status_code))
-        self.assertEqual(Project.objects.get(pk=self.project1.pk).files_count, 1)
+        project = Project.objects.get(pk=self.project1.pk)
 
+        self.assertTrue(status.is_success(response.status_code))
+        self.assertEqual(project.files_count, 1)
+        self.assertEqual(project.file_storage_bytes, 10000000)
         # List files
-        response = self.client.get("/api/v1/files/{}/".format(self.project1.id))
+        response = self.client.get(f"/api/v1/files/{self.project1.id}/")
 
         self.assertTrue(status.is_success(response.status_code))
         self.assertEqual(len(response.json()), 1)
         self.assertEqual("bigfile.big", response.json()[0]["name"])
-        self.assertGreater(response.json()[0]["size"], 10000000)
-        self.assertLess(response.json()[0]["size"], 11000000)
+        self.assertEqual(response.json()[0]["size"], 10000000)
 
     def test_purge_old_versions_command(self):
         """This tests manual purging of old versions with the management command"""
@@ -560,9 +695,6 @@ class QfcTestCase(APITransactionTestCase):
         self.assertEqual(read_version(0), "v17")
         self.assertEqual(read_version(2), "v19")
 
-    @skip(
-        "Temporary disable the purge old versions, as we temporarily disabled purging old versions."
-    )
     def test_purge_old_versions(self):
         """This tests automated purging of old versions when uploading files"""
 

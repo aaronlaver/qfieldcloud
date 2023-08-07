@@ -2,25 +2,31 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from functools import lru_cache
-from typing import Optional, Tuple, TypedDict
+from typing import Optional, Tuple, TypedDict, cast
 
 from constance import config
+from deprecated import deprecated
 from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
-from django.db.models import Q
+from django.db.models import Case, Q
+from django.db.models import Value as V
+from django.db.models import When
 from django.utils import timezone
 from django.utils.translation import gettext as _
 from model_utils.managers import InheritanceManagerMixin
-from qfieldcloud.core.models import Person, User, UserAccount
+from qfieldcloud.core.models import Organization, Person, User, UserAccount
 
 from .exceptions import NotPremiumPlanException
 
+logger = logging.getLogger(__name__)
+
 
 def get_subscription_model() -> "Subscription":
-    return apps.get_model(settings.QFIELDCLOUD_SUBSCRIPTION_MODEL)
+    model = apps.get_model(settings.QFIELDCLOUD_SUBSCRIPTION_MODEL)
+    return cast(Subscription, model)
 
 
 class SubscriptionStatus(models.TextChoices):
@@ -56,7 +62,7 @@ class Plan(models.Model):
     def get_or_create_default(cls) -> "Plan":
         """Returns the default plan, creating one if none exists.
         To be used as a default value for UserAccount.type"""
-        if cls.objects.count() == 0:
+        if not cls.objects.exists():
             with transaction.atomic():
                 cls.objects.create(
                     code="default_user",
@@ -72,7 +78,8 @@ class Plan(models.Model):
                     is_public=False,
                     user_type=User.Type.ORGANIZATION,
                 )
-        return cls.objects.order_by("-is_default").first()
+        result = cls.objects.order_by("-is_default").first()
+        return cast(Plan, result)
 
     # unique identifier of the subscription plan
     code = models.CharField(max_length=100, unique=True)
@@ -178,6 +185,20 @@ class Plan(models.Model):
     # updated at
     updated_at = models.DateTimeField(auto_now=True)
 
+    # admin only notes, not visible to end users
+    notes = models.TextField(
+        _("Admin notes"),
+        blank=True,
+        null=True,
+        help_text=_(
+            "These notes are for internal purposes only and will never be shown to the end users."
+        ),
+    )
+
+    @property
+    def storage_bytes(self) -> int:
+        return self.storage_mb * 1000 * 1000
+
     def save(self, *args, **kwargs):
         if self.user_type not in (User.Type.PERSON, User.Type.ORGANIZATION):
             raise ValidationError(
@@ -246,9 +267,20 @@ class PackageType(models.Model):
     # updated at
     updated_at = models.DateTimeField(auto_now=True)
 
+    # admin only notes, not visible to end users
+    notes = models.TextField(
+        _("Admin notes"),
+        blank=True,
+        null=True,
+        help_text=_(
+            "These notes are for internal purposes only and will never be shown to the end users."
+        ),
+    )
+
     @classmethod
     @lru_cache
     def get_storage_package_type(cls):
+        # NOTE if the cache is still returning the old result, please restart the whole `app` container
         try:
             return cls.objects.get(type=cls.Type.STORAGE)
         except cls.DoesNotExist:
@@ -306,6 +338,16 @@ class Package(models.Model):
     # updated at
     updated_at = models.DateTimeField(auto_now=True)
 
+    # admin only notes, not visible to end users
+    notes = models.TextField(
+        _("Admin notes"),
+        blank=True,
+        null=True,
+        help_text=_(
+            "These notes are for internal purposes only and will never be shown to the end users."
+        ),
+    )
+
 
 # TODO add check constraint makes sure there are no two active additional packages at the same time,
 # because we assume that once you change your quantity, the old Package instance has an end_date
@@ -313,21 +355,80 @@ class Package(models.Model):
 
 
 class SubscriptionQuerySet(models.QuerySet):
-    def active(self):
+    def current(self):
+        """
+        Returns the subscriptions which are relevant to the current moment.
+        NOTE Some of the subscriptions in the queryset might not be active, but cancelled or drafted.
+        """
         now = timezone.now()
         qs = self.filter(
             Q(active_since__lte=now)
             & (Q(active_until__isnull=True) | Q(active_until__gte=now))
-        )
+        ).select_related("plan")
 
         return qs
+
+    @deprecated("Use `current` instead. Remove this once parent repo uses current")
+    def active(self):
+        return self.current()
+
+    def managed_by(self, user_id: int):
+        """Returns all subscriptions that are managed by given `user_id`. It means the owner personal account and all organizations they own.
+
+        Args:
+            user_id (int): the user we are searching against
+        """
+        if not user_id:
+            # NOTE: for logged out AnonymousUser the user_id is None
+            return self.none()
+
+        return self.filter(
+            Q(account_id=user_id)
+            | Q(account__user__organization__organization_owner_id=user_id)
+        )
+
+    def activeness(self):
+        """Annotates with additional `is_active` boolean field.
+
+        `is_active` - if the period and status are active.
+
+        NOTE This method is intended to be automatically called for each queryset.
+        """
+        is_period_active_condition = Q(active_since__lte=V("now")) & (
+            Q(active_until__isnull=True) | Q(active_until__gte=V("now"))
+        )
+        is_status_active_condition = Q(
+            status__in=(
+                Subscription.Status.ACTIVE_PAID,
+                Subscription.Status.ACTIVE_PAST_DUE,
+            )
+        )
+        return self.annotate(
+            is_active=Case(
+                When(
+                    is_period_active_condition & is_status_active_condition, then=True
+                ),
+                default=False,
+            ),
+        )
+
+
+class SubscriptionManager(models.Manager):
+    def get_queryset(self):
+        return SubscriptionQuerySet(self.model, using=self._db).activeness()
+
+    def current(self):
+        return self.get_queryset().current()
+
+    def managed_by(self, user_id: int):
+        return self.get_queryset().managed_by(user_id)
 
 
 class AbstractSubscription(models.Model):
     class Meta:
         abstract = True
 
-    objects = SubscriptionQuerySet.as_manager()
+    objects = SubscriptionManager()
 
     Status = SubscriptionStatus
 
@@ -378,23 +479,34 @@ class AbstractSubscription(models.Model):
     billing_cycle_anchor_at = models.DateTimeField(null=True, blank=True)
 
     # the timestamp when the current billing period started
-    # NOTE this field remains currently unused.
+    # NOTE ignored when checking if subscription is 'current' (see `active_since and `active_until`).
+    # `current_period_since` and `current_period_until` are both either `None` or `datetime`
     current_period_since = models.DateTimeField(null=True, blank=True)
 
     # the timestamp when the current billing period ends
-    # NOTE ignored for subscription validity checks, but used to calculate the activation date when additional packages change
+    # NOTE ignored when checking if subscription is 'current' (see `active_since and `active_until`),
+    # but used to calculate the activation date when additional packages change.
+    # `current_period_since` and `current_period_until` are both either `None` or `datetime`
     current_period_until = models.DateTimeField(null=True, blank=True)
 
-    @property
-    def is_active(self) -> bool:
-        return self.status in [
-            SubscriptionStatus.ACTIVE_PAID,
-            SubscriptionStatus.ACTIVE_PAST_DUE,
-        ]
+    # admin only notes, not visible to end users
+    notes = models.TextField(
+        _("Admin notes"),
+        blank=True,
+        null=True,
+        help_text=_(
+            "These notes are for internal purposes only and will never be shown to the end users."
+        ),
+    )
 
     @property
+    @deprecated("Use `AbstractSubscription.active_storage_total_bytes` instead")
     def active_storage_total_mb(self) -> int:
         return self.plan.storage_mb + self.active_storage_package_mb
+
+    @property
+    def active_storage_total_bytes(self) -> int:
+        return self.plan.storage_bytes + self.active_storage_package_bytes
 
     @property
     def active_storage_package(self) -> Package:
@@ -405,10 +517,22 @@ class AbstractSubscription(models.Model):
         return self.get_active_package_quantity(PackageType.get_storage_package_type())
 
     @property
+    @deprecated("Use `AbstractSubscription.active_storage_package_bytes` instead")
     def active_storage_package_mb(self) -> int:
         return (
             self.get_active_package_quantity(PackageType.get_storage_package_type())
             * PackageType.get_storage_package_type().unit_amount
+        )
+
+    @property
+    def active_storage_package_bytes(self) -> int:
+        return (
+            (
+                self.get_active_package_quantity(PackageType.get_storage_package_type())
+                * PackageType.get_storage_package_type().unit_amount
+            )
+            * 1000
+            * 1000
         )
 
     @property
@@ -458,6 +582,7 @@ class AbstractSubscription(models.Model):
 
     @property
     def active_users(self):
+        "Returns the queryset of active users for running stripe billing period or None."
         if not self.account.user.is_organization:
             return None
 
@@ -467,17 +592,7 @@ class AbstractSubscription(models.Model):
                 self.current_period_until,
             )
 
-        assert (
-            self.current_period_since == self.current_period_until
-        ), "Both current_period _since and _until must be set."
-
-        now = timezone.now()
-        month_ago = now - timedelta(days=28)
-
-        return self.account.user.active_users(
-            month_ago,
-            now,
-        )
+        return None
 
     @property
     def active_users_count(self) -> int:
@@ -485,7 +600,7 @@ class AbstractSubscription(models.Model):
         if not self.account.user.is_organization:
             return 1
 
-        if not self.current_period_since or not self.current_period_until:
+        if self.active_users is None:
             return 0
 
         return self.active_users.count()
@@ -528,6 +643,8 @@ class AbstractSubscription(models.Model):
         with transaction.atomic():
             if active_since is None:
                 active_since = timezone.now()
+
+            active_since = active_since.replace(microsecond=0)
             new_package = None
 
             # delete future packages for that subscription, as we would create a new one if needed
@@ -563,32 +680,38 @@ class AbstractSubscription(models.Model):
         return old_package, new_package
 
     @classmethod
-    def get_or_create_active_subscription(cls, account: UserAccount) -> "Subscription":
-        """Returns the currently active subscription, if not exists returns a newly created subscription with the default plan.
+    def get_or_create_current_subscription(cls, account: UserAccount) -> "Subscription":
+        """Returns the current subscription, if not exists returns a newly created subscription with the default plan.
 
         Args:
             account (UserAccount): the account the subscription belongs to.
 
         Returns:
-            Self: the currently active subscription
+            Self: the current subscription
 
         TODO Python 3.11 the actual return type is Self
         """
         try:
-            subscription = cls.objects.active().get(account_id=account.pk)
+            subscription = cls.objects.current().get(account_id=account.pk)
         except cls.DoesNotExist:
             subscription = cls.create_default_plan_subscription(account)
 
         return subscription
 
+    @property
+    @deprecated("Use `get_or_create_current_subscription` instead")
+    def get_or_create_active_subscription(cls, account: UserAccount) -> "Subscription":
+        return cls.get_or_create_current_subscription(account)
+
     @classmethod
     def get_upcoming_subscription(cls, account: UserAccount) -> "Subscription":
-        return (
+        result = (
             cls.objects.filter(account_id=account.pk, active_since__gt=timezone.now())
             .exclude(status__in=[Subscription.Status.INACTIVE_CANCELLED])
             .order_by("active_since")
             .first()
         )
+        return cast(Subscription, result)
 
     @classmethod
     def update_subscription(
@@ -617,7 +740,7 @@ class AbstractSubscription(models.Model):
                 subscription.active_since is None
                 and kwargs.get("active_since") is not None
             ):
-                cls.objects.active().filter(account=subscription.account,).exclude(
+                cls.objects.current().filter(account=subscription.account,).exclude(
                     pk=subscription.pk,
                 ).update(
                     status=Subscription.Status.INACTIVE_CANCELLED,
@@ -628,7 +751,7 @@ class AbstractSubscription(models.Model):
                 update_fields.append(attr_name)
                 setattr(subscription, attr_name, attr_value)
 
-            logging.info(f"Updated subscription's fields: {', '.join(update_fields)}")
+            logger.info(f"Updated subscription's fields: {', '.join(update_fields)}")
 
             subscription.save(update_fields=update_fields)
 
@@ -655,7 +778,9 @@ class AbstractSubscription(models.Model):
         )
 
         if account.user.is_organization:
-            created_by = account.user.organization_owner
+            # NOTE sometimes `account.user` is not an organization, e.g. when setting
+            # `active_until` on an organization account
+            created_by = Organization.objects.get(pk=account.pk).organization_owner
         else:
             created_by = account.user
 
@@ -692,22 +817,35 @@ class AbstractSubscription(models.Model):
 
         TODO Python 3.11 the actual return type is Self
         """
+        if active_since:
+            # remove microseconds as there will be slight shift with the remote system data
+            active_since = active_since.replace(microsecond=0)
+
         if plan.is_trial:
             assert isinstance(
                 active_since, datetime
             ), "Creating a trial plan requires `active_since` to be a valid datetime object"
 
             active_until = active_since + timedelta(days=config.TRIAL_PERIOD_DAYS)
+            logger.info(
+                f"Creating trial subscription from {active_since=} to {active_until=}"
+            )
             trial_subscription = cls.objects.create(
                 plan=plan,
                 account=account,
                 created_by=created_by,
-                # TODO in the future the status can be configured in the `Plan.initial_subscription_status`
                 status=plan.initial_subscription_status,
                 active_since=active_since,
                 active_until=active_until,
             )
-            # the regular plan should be the default plan
+            # NOTE to get annotations, mostly `is_active`
+            trial_subscription_obj = cls.objects.get(pk=trial_subscription.pk)
+
+            if created_by.remaining_trial_organizations > 0:
+                created_by.remaining_trial_organizations -= 1
+                created_by.save(update_fields=["remaining_trial_organizations"])
+
+            # the trial plan should be the default plan
             regular_plan = Plan.objects.get(
                 user_type=account.user.type,
                 is_default=True,
@@ -716,10 +854,19 @@ class AbstractSubscription(models.Model):
             # the end date of the trial is the start date of the regular
             regular_active_since = active_until
         else:
-            trial_subscription = None
+            trial_subscription_obj = None
             regular_plan = plan
             regular_active_since = active_since
 
+            # NOTE in case the user had a custom amount set (e.g manually set by support) this will
+            # be overwritten by a subscription plan change.
+            # But taking care of this would add quite some complexity.
+            created_by.remaining_trial_organizations = (
+                regular_plan.max_trial_organizations
+            )
+            created_by.save(update_fields=["remaining_trial_organizations"])
+
+        logger.info(f"Creating regular subscription from {regular_active_since}")
         regular_subscription = cls.objects.create(
             plan=regular_plan,
             account=account,
@@ -727,8 +874,13 @@ class AbstractSubscription(models.Model):
             status=regular_plan.initial_subscription_status,
             active_since=regular_active_since,
         )
+        # NOTE to get annotations, mostly `is_active`
+        regular_subscription_obj = cls.objects.get(pk=regular_subscription.pk)
 
-        return trial_subscription, regular_subscription
+        return trial_subscription_obj, regular_subscription_obj
+
+    def __str__(self):
+        return f"{self.__class__.__name__} #{self.id} user:{self.account.user.username} plan:{self.plan.code} total:{self.active_storage_total_mb}MB"
 
 
 class Subscription(AbstractSubscription):
@@ -743,5 +895,5 @@ class CurrentSubscription(AbstractSubscription):
     account = models.OneToOneField(
         UserAccount,
         on_delete=models.CASCADE,
-        related_name="current_subscription",
+        related_name="current_subscription_vw",
     )

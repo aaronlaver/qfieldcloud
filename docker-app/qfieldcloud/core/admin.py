@@ -1,18 +1,30 @@
+import csv
 import json
 import time
-from typing import Any, Dict
+from collections import namedtuple
+from datetime import datetime
+from itertools import chain
+from typing import Any, Dict, Generator
 
+from allauth.account.admin import EmailAddressAdmin as EmailAddressAdminBase
 from allauth.account.forms import EmailAwarePasswordResetTokenGenerator
+from allauth.account.models import EmailAddress
 from allauth.account.utils import user_pk_to_url_str
 from allauth.socialaccount.models import SocialAccount, SocialApp, SocialToken
+from auditlog.admin import LogEntryAdmin as BaseLogEntryAdmin
+from auditlog.filters import ResourceTypeFilter
+from auditlog.models import ContentType, LogEntry
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.admin.templatetags.admin_urls import admin_urlname
-from django.contrib.auth.models import Group
+from django.contrib.admin.views.main import ChangeList
 from django.core.exceptions import PermissionDenied
+from django.db.models import Q, QuerySet
 from django.db.models.fields.json import JSONField
+from django.db.models.functions import Lower
 from django.forms import ModelForm, fields, widgets
-from django.http.response import Http404, HttpResponseRedirect
+from django.http import HttpRequest
+from django.http.response import Http404, HttpResponseRedirect, StreamingHttpResponse
 from django.shortcuts import resolve_url
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
@@ -40,10 +52,53 @@ from qfieldcloud.core.models import (
     User,
     UserAccount,
 )
+from qfieldcloud.core.paginators import LargeTablePaginator
+from qfieldcloud.core.templatetags.filters import filesizeformat10
 from qfieldcloud.core.utils2 import jobs
 from rest_framework.authtoken.models import TokenProxy
 
+admin.site.unregister(LogEntry)
+
 Invitation = get_invitation_model()
+
+
+class NoPkOrderChangeList(ChangeList):
+    """
+    DjangoAdmin ChangeList adds an ordering -pk to ensure
+    'deterministic ordering to all db backends'. This has a negative
+    impact on performance and optimization.
+    Therefore remove the extra ordering -pk if custom
+    order fields are provided.
+    """
+
+    def get_ordering(self, request, queryset):
+        order_fields = super().get_ordering(request, queryset)
+        if len(order_fields) > 1 and "-pk" in order_fields:
+            order_fields.remove("-pk")
+        return order_fields
+
+
+class ModelAdminNoPkOrderChangeListMixin:
+    def get_changelist(self, request):
+        return NoPkOrderChangeList
+
+
+class ModelAdminEstimateCountMixin:
+    # Avoid repetitive counting large list views.
+    # Instead use pg metadata estimate.
+    paginator = LargeTablePaginator
+
+    # Display '(Show all)' instead of '(<count>)' in search bar
+    show_full_result_count = False
+
+    # Overwrite the default Django configuration of 100
+    list_per_page = settings.QFIELDCLOUD_ADMIN_LIST_PER_PAGE
+
+
+class QFieldCloudModelAdmin(
+    ModelAdminNoPkOrderChangeListMixin, ModelAdminEstimateCountMixin, admin.ModelAdmin
+):
+    pass
 
 
 def admin_urlname_by_obj(value, arg):
@@ -65,10 +120,146 @@ def admin_urlname_by_obj(value, arg):
 # Unregister admins from other Django apps
 admin.site.unregister(Invitation)
 admin.site.unregister(TokenProxy)
-admin.site.unregister(Group)
 admin.site.unregister(SocialAccount)
 admin.site.unregister(SocialApp)
 admin.site.unregister(SocialToken)
+admin.site.unregister(EmailAddress)
+
+UserEmailDetails = namedtuple(
+    "UserEmailDetails",
+    [
+        "id",
+        "username",
+        "first_name",
+        "last_name",
+        "type",
+        "email",
+        "date_joined",
+        "last_login",
+        "verified",
+        "owner_id",
+        "owner_username",
+        "owner_email",
+        "owner_first_name",
+        "owner_last_name",
+        "owner_date_joined",
+        "owner_last_login",
+    ],
+)
+
+
+class EmailAddressAdmin(EmailAddressAdminBase):
+    def get_urls(self):
+        urls = super().get_urls()
+        return [
+            path(
+                "admin/export_emails_to_csv/",
+                self.admin_site.admin_view(self.export_emails_to_csv),
+                name="export_emails_to_csv",
+            ),
+            *urls,
+        ]
+
+    def gen_users_email_addresses(self) -> Generator[UserEmailDetails, None, None]:
+        raw_queryset = User.objects.raw(
+            """
+            WITH u AS (
+                SELECT
+                    DISTINCT ON (COALESCE(ae.email, u.email)) COALESCE(ae.email, u.email) AS "email",
+                    u.id,
+                    u.username,
+                    u.first_name,
+                    u.last_name,
+                    u.type,
+                    u.last_login,
+                    u.date_joined
+                FROM
+                    core_user u
+                    LEFT JOIN account_emailaddress ae ON ae.user_id = u.id AND ae.primary
+                WHERE
+                    COALESCE(ae.email, u.email) IS NOT NULL
+                    AND COALESCE(ae.email, u.email) != ''
+                ORDER BY
+                    COALESCE(ae.email, u.email),
+                    u.type
+            )
+            SELECT
+                u.id,
+                u.username,
+                u.email,
+                u.first_name,
+                u.last_name,
+                u.date_joined,
+                u.last_login,
+                u.type,
+                ae.verified,
+                oo.id AS "owner_id",
+                oo.username AS "owner_username",
+                oo.email AS "owner_email",
+                oo.first_name AS "owner_first_name",
+                oo.last_name AS "owner_last_name",
+                oo.date_joined AS "owner_date_joined",
+                oo.last_login AS "owner_last_login"
+            FROM
+                u
+                LEFT JOIN account_emailaddress ae ON ae.user_id = u.id
+                LEFT JOIN core_organization o ON o.user_ptr_id = u.id
+                LEFT JOIN u oo ON oo.id = o.organization_owner_id
+            ORDER BY u.id
+            """
+        )
+        return (
+            UserEmailDetails(
+                row.id,
+                row.username,
+                row.first_name,
+                row.last_name,
+                row.type,
+                row.email,
+                row.date_joined,
+                row.last_login,
+                row.verified,
+                row.owner_id,
+                row.owner_username,
+                row.owner_email,
+                row.owner_first_name,
+                row.owner_last_name,
+                row.owner_date_joined,
+                row.owner_last_login,
+            )
+            for row in raw_queryset
+        )
+
+    @admin.action(description="Export all users' email contact details to .csv")
+    def export_emails_to_csv(self, request) -> StreamingHttpResponse:
+        """ "Export all users' email contact details to .csv"""
+
+        class PseudoBuffer:
+            # Good idea from https://docs.djangoproject.com/en/4.1/howto/outputting-csv/
+            def write(self, value):
+                return value
+
+        def human_readable_timestamp() -> str:
+            d, h = str(datetime.utcnow()).split(" ")
+            d = d.replace("-", "")
+            h = h[:-7].replace(":", "")
+            return "_".join([d, h])
+
+        email_rows = self.gen_users_email_addresses()
+        pseudo_buffer = PseudoBuffer()
+        writer = csv.DictWriter(pseudo_buffer, fieldnames=UserEmailDetails._fields)
+        header = {k: k for k in UserEmailDetails._fields}
+        write_with_header = chain(
+            [writer.writerow(header)],
+            (writer.writerow(row._asdict()) for row in email_rows),
+        )
+        filename = f"qfc_user_email_{human_readable_timestamp()}"
+
+        return StreamingHttpResponse(
+            write_with_header,
+            content_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}.csv"},
+        )
 
 
 class PrettyJSONWidget(widgets.Textarea):
@@ -176,14 +367,10 @@ class UserAccountInline(admin.StackedInline):
     extra = 1
 
     def has_add_permission(self, request, obj):
-        if obj is None:
-            return True
-        return obj.type in (User.Type.PERSON, User.Type.ORGANIZATION)
+        return obj is None
 
     def has_delete_permission(self, request, obj):
-        if obj is None:
-            return True
-        return obj.type in (User.Type.PERSON, User.Type.ORGANIZATION)
+        return False
 
 
 class ProjectInline(admin.TabularInline):
@@ -226,7 +413,7 @@ class UserProjectCollaboratorInline(admin.TabularInline):
         return obj.type == User.Type.PERSON
 
 
-class PersonAdmin(admin.ModelAdmin):
+class PersonAdmin(QFieldCloudModelAdmin):
     list_display = (
         "username",
         "first_name",
@@ -237,6 +424,7 @@ class PersonAdmin(admin.ModelAdmin):
         "is_active",
         "date_joined",
         "last_login",
+        # "storage_usage__field",
     )
     list_filter = (
         "type",
@@ -245,9 +433,10 @@ class PersonAdmin(admin.ModelAdmin):
         "is_staff",
     )
 
-    search_fields = ("username__icontains",)
+    search_fields = ("username__icontains", "email__iexact")
 
     fields = (
+        "storage_usage__field",
         "username",
         "password",
         "email",
@@ -258,9 +447,17 @@ class PersonAdmin(admin.ModelAdmin):
         "is_superuser",
         "is_staff",
         "is_active",
+        "groups",
         "remaining_invitations",
+        "remaining_trial_organizations",
         "has_newsletter_subscription",
         "has_accepted_tos",
+    )
+
+    readonly_fields = (
+        "date_joined",
+        "last_login",
+        "storage_usage__field",
     )
 
     inlines = (
@@ -270,6 +467,22 @@ class PersonAdmin(admin.ModelAdmin):
 
     add_form_template = "admin/change_form.html"
     change_form_template = "admin/person_change_form.html"
+
+    @admin.display(description=_("Storage"))
+    def storage_usage__field(self, instance) -> str:
+        active_storage_total = filesizeformat10(
+            instance.useraccount.current_subscription.active_storage_total_bytes
+        )
+        used_storage = filesizeformat10(instance.useraccount.storage_used_bytes)
+        used_storage_perc = instance.useraccount.storage_used_ratio * 100
+        free_storage = filesizeformat10(instance.useraccount.storage_free_bytes)
+
+        return _("total: {}; used: {} ({:.2f}%); free: {}").format(
+            active_storage_total,
+            used_storage,
+            used_storage_perc,
+            free_storage,
+        )
 
     def save_model(self, request, obj, form, change):
         # Set the password to the value in the field if it's changed.
@@ -330,7 +543,17 @@ class PersonAdmin(admin.ModelAdmin):
 
 class ProjectCollaboratorInline(admin.TabularInline):
     model = ProjectCollaborator
+
     extra = 0
+
+    readonly_fields = (
+        "created_by",
+        "updated_by",
+        "created_at",
+        "updated_at",
+    )
+
+    autocomplete_fields = ("collaborator",)
 
 
 class ProjectFilesWidget(widgets.Input):
@@ -348,7 +571,7 @@ class ProjectForm(ModelForm):
         fields = "__all__"  # required for Django 3.x
 
 
-class ProjectAdmin(admin.ModelAdmin):
+class ProjectAdmin(QFieldCloudModelAdmin):
     form = ProjectForm
     list_display = (
         "id",
@@ -370,8 +593,10 @@ class ProjectAdmin(admin.ModelAdmin):
         "description",
         "is_public",
         "owner",
+        "status",
+        "status_code",
         "project_filename",
-        "storage_size_mb",
+        "file_storage_bytes",
         "created_at",
         "updated_at",
         "data_last_updated_at",
@@ -381,7 +606,9 @@ class ProjectAdmin(admin.ModelAdmin):
     )
     readonly_fields = (
         "id",
-        "storage_size_mb",
+        "status",
+        "status_code",
+        "file_storage_bytes",
         "created_at",
         "updated_at",
         "data_last_updated_at",
@@ -394,6 +621,7 @@ class ProjectAdmin(admin.ModelAdmin):
         "name__icontains",
         "owner__username__iexact",
     )
+    autocomplete_fields = ("owner",)
 
     ordering = ("-updated_at",)
 
@@ -433,6 +661,17 @@ class ProjectAdmin(admin.ModelAdmin):
 
         return format_pre_json(instance.project_details)
 
+    def save_formset(self, request, form, formset, change):
+        for form_obj in formset:
+            if isinstance(form_obj.instance, ProjectCollaborator):
+                # add created_by only if it's a newly created collaborator
+                if form_obj.instance.id is None:
+                    form_obj.instance.created_by = request.user
+
+                form_obj.instance.updated_by = request.user
+
+        super().save_formset(request, form, formset, change)
+
 
 class DeltaInline(admin.TabularInline):
     model = ApplyJob.deltas_to_apply.through
@@ -454,18 +693,50 @@ class DeltaInline(admin.TabularInline):
     #     return format_pre_json(instance.feedback)
 
 
-class JobAdmin(admin.ModelAdmin):
+class IsFinalizedJobFilter(admin.SimpleListFilter):
+    title = _("finalized job")
+    parameter_name = "finalized"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("finalized", _("finalized")),
+            ("not finalized", _("not finalized")),
+        )
+
+    def queryset(self, request, queryset) -> QuerySet:
+        value = self.value()
+
+        if value is None:
+            return queryset
+
+        not_finalized = (
+            Q(status=Job.Status.PENDING)
+            | Q(status=Job.Status.STARTED)
+            | Q(status=Job.Status.QUEUED)
+        )
+        if value == "not finalized":
+            return queryset.filter(not_finalized)
+        elif value == "finalized":
+            return queryset.filter(~not_finalized)
+        else:
+            raise NotImplementedError(
+                f"Unknown filter: {value} (was expecting 'finalized' or 'not finalized')"
+            )
+
+
+class JobAdmin(QFieldCloudModelAdmin):
     list_display = (
         "id",
         "project__owner",
         "project__name",
         "type",
         "status",
+        "error_type",
         "created_by__link",
         "created_at",
         "updated_at",
     )
-    list_filter = ("type", "status", "updated_at")
+    list_filter = ("type", "status", "updated_at", IsFinalizedJobFilter)
     list_select_related = ("project", "project__owner", "created_by")
     exclude = ("feedback", "output")
     ordering = ("-updated_at",)
@@ -477,14 +748,20 @@ class JobAdmin(admin.ModelAdmin):
     readonly_fields = (
         "project",
         "status",
+        "error_type",
         "type",
         "created_at",
         "updated_at",
         "started_at",
         "finished_at",
+        "docker_started_at",
+        "docker_finished_at",
         "output__pre",
         "feedback__pre",
     )
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).defer("output", "feedback")
 
     def get_object(self, request, object_id, from_field=None):
         obj = super().get_object(request, object_id, from_field)
@@ -509,6 +786,12 @@ class JobAdmin(admin.ModelAdmin):
             inlines.append(DeltaInline)
 
         return inlines
+
+    def error_type(self, instance):
+        if instance.feedback and "error_type" in instance.feedback:
+            return f"{instance.feedback['error_type']}".strip()
+
+        return None
 
     def project__owner(self, instance):
         return model_admin_url(instance.project.owner)
@@ -569,7 +852,37 @@ class ApplyJobDeltaInline(admin.TabularInline):
         return False
 
 
-class DeltaAdmin(admin.ModelAdmin):
+class IsFinalizedDeltaJobFilter(admin.SimpleListFilter):
+    title = _("finalized delta job")
+    parameter_name = "finalized"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("finalized", _("finalized")),
+            ("not finalized", _("not finalized")),
+        )
+
+    def queryset(self, request, queryset) -> QuerySet:
+        value = self.value()
+
+        if value is None:
+            return queryset
+
+        not_finalized = Q(last_status=Delta.Status.PENDING) | Q(
+            last_status=Delta.Status.STARTED
+        )
+
+        if value == "not finalized":
+            return queryset.filter(not_finalized)
+        elif value == "finalized":
+            return queryset.filter(~not_finalized)
+        else:
+            raise NotImplementedError(
+                f"Unknown filter: {value} (was expecting 'finalized' or 'not finalized')"
+            )
+
+
+class DeltaAdmin(QFieldCloudModelAdmin):
     list_display = (
         "id",
         "deltafile_id",
@@ -580,7 +893,7 @@ class DeltaAdmin(admin.ModelAdmin):
         "created_at",
         "updated_at",
     )
-    list_filter = ("last_status", "updated_at")
+    list_filter = ("last_status", "updated_at", IsFinalizedDeltaJobFilter)
 
     actions = (
         "set_status_pending",
@@ -597,6 +910,8 @@ class DeltaAdmin(admin.ModelAdmin):
         "created_by",
         "created_at",
         "updated_at",
+        "old_geom_truncated",
+        "new_geom_truncated",
     )
     fields = (
         "project",
@@ -608,6 +923,8 @@ class DeltaAdmin(admin.ModelAdmin):
         "content",
         "last_feedback__pre",
         "last_modified_pk",
+        "old_geom_truncated",
+        "new_geom_truncated",
     )
     search_fields = (
         "project__name__iexact",
@@ -626,7 +943,18 @@ class DeltaAdmin(admin.ModelAdmin):
 
     change_form_template = "admin/delta_change_form.html"
 
+    def old_geom_truncated(self, instance):
+        return self.geom_truncated(instance.old_geom)
+
+    def new_geom_truncated(self, instance):
+        return self.geom_truncated(instance.new_geom)
+
+    # Show geometries only truncated as they are fully shown in content
+    def geom_truncated(self, geom):
+        return f"{str(geom)[:70]} ..." if geom else "-"
+
     # This will disable add functionality
+
     def has_add_permission(self, request):
         return False
 
@@ -678,7 +1006,7 @@ class DeltaAdmin(admin.ModelAdmin):
         return super().response_change(request, delta)
 
 
-class GeodbAdmin(admin.ModelAdmin):
+class GeodbAdmin(QFieldCloudModelAdmin):
     list_filter = ("created_at", "hostname")
     list_display = (
         "user",
@@ -716,7 +1044,7 @@ class GeodbAdmin(admin.ModelAdmin):
             messages.add_message(
                 request,
                 messages.WARNING,
-                "The password is (shown only once): {}".format(obj.password),
+                f"The password is (shown only once): {obj.password}",
             )
         super().save_model(request, obj, form, change)
 
@@ -725,6 +1053,8 @@ class OrganizationMemberInline(admin.TabularInline):
     model = OrganizationMember
     fk_name = "organization"
     extra = 0
+
+    autocomplete_fields = ("member",)
 
 
 class TeamInline(admin.TabularInline):
@@ -744,7 +1074,7 @@ class TeamInline(admin.TabularInline):
         return False
 
 
-class OrganizationAdmin(admin.ModelAdmin):
+class OrganizationAdmin(QFieldCloudModelAdmin):
     inlines = (
         UserAccountInline,
         GeodbInline,
@@ -753,9 +1083,12 @@ class OrganizationAdmin(admin.ModelAdmin):
         TeamInline,
     )
     fields = (
+        "storage_usage__field",
         "username",
         "email",
         "organization_owner",
+        "date_joined",
+        "active_users_links",
     )
     list_display = (
         "username",
@@ -767,16 +1100,48 @@ class OrganizationAdmin(admin.ModelAdmin):
     search_fields = (
         "username__icontains",
         "organization_owner__username__icontains",
+        "email__iexact",
+        "organization_owner__email__iexact",
     )
 
-    list_select_related = ("organization_owner",)
+    readonly_fields = (
+        "date_joined",
+        "storage_usage__field",
+        "active_users_links",
+    )
+
+    list_select_related = ("organization_owner", "useraccount")
 
     list_filter = ("date_joined",)
 
+    autocomplete_fields = ("organization_owner",)
+
+    @admin.display(description=_("Active members"))
+    def active_users_links(self, instance) -> str:
+        persons = instance.useraccount.current_subscription.active_users
+        userlinks = "<p> - </p>"
+        if persons:
+            userlinks = "<br>".join(model_admin_url(p, p.username) for p in persons)
+        help_text = """
+        <p style="font-size: 11px; color: var(--body-quiet-color)">
+            Active members have triggererd at least one job or uploaded at least one delta in the current billing period.
+            These are all the users who will be billed -- plan included or additional.
+        </p>
+        """
+        return format_html(f"{userlinks} {help_text}")
+
+    @admin.display(description=_("Owner"))
     def organization_owner__link(self, instance):
         return model_admin_url(
             instance.organization_owner, instance.organization_owner.username
         )
+
+    @admin.display(description=_("Storage"))
+    def storage_usage__field(self, instance) -> str:
+        used_storage = filesizeformat10(instance.useraccount.storage_used_bytes)
+        free_storage = filesizeformat10(instance.useraccount.storage_free_bytes)
+        used_storage_perc = instance.useraccount.storage_used_ratio * 100
+        return f"{used_storage} {free_storage} ({used_storage_perc:.2f}%)"
 
     def get_search_results(self, request, queryset, search_term):
         filters = search_parser(
@@ -808,8 +1173,10 @@ class TeamMemberInline(admin.TabularInline):
     fk_name = "team"
     extra = 0
 
+    autocomplete_fields = ("member",)
 
-class TeamAdmin(admin.ModelAdmin):
+
+class TeamAdmin(QFieldCloudModelAdmin):
     inlines = (TeamMemberInline,)
 
     list_display = (
@@ -825,6 +1192,8 @@ class TeamAdmin(admin.ModelAdmin):
     search_fields = ("username__icontains", "team_organization__username__iexact")
 
     list_filter = ("date_joined",)
+
+    autocomplete_fields = ("team_organization",)
 
     def save_model(self, request, obj, form, change):
         if not obj.username.startswith("@"):
@@ -843,6 +1212,42 @@ class InvitationAdmin(InvitationAdminBase):
     search_fields = ("email__icontains", "inviter__username__iexact")
 
 
+class UserAccountAdmin(QFieldCloudModelAdmin):
+    """The sole purpose of this admin module is only to support autocomplete fields in Django admin."""
+
+    ordering = (Lower("user__username"),)
+    search_fields = ("user__username__icontains",)
+    list_select_related = ("user",)
+
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        # hide this module from Django admin, it is accessible via "Person" and "Organization" as inline edit
+        return False
+
+
+class UserAdmin(QFieldCloudModelAdmin):
+    """The sole purpose of this admin module is only to support autocomplete fields in Django admin."""
+
+    ordering = (Lower("username"),)
+    search_fields = ("username__icontains",)
+
+    def has_module_permission(self, request: HttpRequest) -> bool:
+        # hide this module from Django admin, it is accessible via "Person" and "Organization" as inline edit
+        return False
+
+
+class QFieldCloudResourceTypeFilter(ResourceTypeFilter):
+    def lookups(self, request, model_admin):
+        qs = ContentType.objects.all().order_by("model")
+        types = qs.values_list("id", "model")
+        return types
+
+
+class LogEntryAdmin(
+    ModelAdminNoPkOrderChangeListMixin, ModelAdminEstimateCountMixin, BaseLogEntryAdmin
+):
+    list_filter = ("action", QFieldCloudResourceTypeFilter)
+
+
 admin.site.register(Invitation, InvitationAdmin)
 admin.site.register(Person, PersonAdmin)
 admin.site.register(Organization, OrganizationAdmin)
@@ -851,3 +1256,9 @@ admin.site.register(Project, ProjectAdmin)
 admin.site.register(Delta, DeltaAdmin)
 admin.site.register(Job, JobAdmin)
 admin.site.register(Geodb, GeodbAdmin)
+admin.site.register(LogEntry, LogEntryAdmin)
+
+# The sole purpose of the `User` and `UserAccount` admin modules is only to support autocomplete fields in Django admin
+admin.site.register(User, UserAdmin)
+admin.site.register(UserAccount, UserAccountAdmin)
+admin.site.register(EmailAddress, EmailAddressAdmin)
